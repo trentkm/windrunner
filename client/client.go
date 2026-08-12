@@ -152,6 +152,22 @@ func (c *Client) SetMetadata(id string, metadata map[string]string) error {
 	return err
 }
 
+// Input delivers terminal input without an attachment — the way
+// automation writes; attachments are for watching.
+func (c *Client) Input(id string, data []byte) error {
+	_, err := c.call(wire.Request{Op: "input", ID: id, Bytes: data})
+	return err
+}
+
+// Snapshot reads a session's exact terminal state without attaching.
+func (c *Client) Snapshot(id string) (wire.SnapshotPayload, error) {
+	response, err := c.call(wire.Request{Op: "snapshot", ID: id})
+	if err != nil {
+		return wire.SnapshotPayload{}, err
+	}
+	return *response.Snapshot, nil
+}
+
 // Attachment is one live view of one session, on its own connection.
 type Attachment struct {
 	conn     net.Conn

@@ -2,6 +2,7 @@ package server
 
 import (
 	"net"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -21,7 +22,14 @@ func stripANSI(text string) string {
 
 func startStack(t *testing.T) *client.Client {
 	t.Helper()
-	socket := filepath.Join(t.TempDir(), "wr.sock")
+	// Not t.TempDir(): unix socket paths cap at 104 bytes on macOS, and
+	// long test names push the per-test dir past it.
+	dir, err := os.MkdirTemp("", "wr")
+	if err != nil {
+		t.Fatalf("tempdir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "wr.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -163,5 +171,35 @@ func TestResizeOverTheWire(t *testing.T) {
 	}
 	if resized.Cols != 132 || resized.Rows != 43 {
 		t.Fatalf("size %dx%d, want 132x43", resized.Cols, resized.Rows)
+	}
+}
+
+func TestInputAndSnapshotWithoutAttachment(t *testing.T) {
+	c := startStack(t)
+	info, err := c.Spawn(wire.Request{
+		Command: "/bin/sh",
+		Args:    []string{"-c", `read line; printf 'heard:%s\n' "$line"; sleep 60`},
+		Cols:    80,
+		Rows:    24,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if err := c.Input(info.ID, []byte("no attachment needed\r")); err != nil {
+		t.Fatalf("Input: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		snapshot, err := c.Snapshot(info.ID)
+		if err != nil {
+			t.Fatalf("Snapshot: %v", err)
+		}
+		if strings.Contains(stripANSI(string(snapshot.ANSI)), "heard:no attachment needed") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("input never landed:\n%s", stripANSI(string(snapshot.ANSI)))
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

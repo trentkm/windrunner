@@ -16,10 +16,8 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"golang.org/x/term"
@@ -212,87 +210,17 @@ func runNew(args []string) error {
 }
 
 func runAttach(c *client.Client, id string) error {
-	stdin := int(os.Stdin.Fd())
-	if !term.IsTerminal(stdin) {
-		return fmt.Errorf("attach needs a terminal")
-	}
-	// Match the session to this terminal before the snapshot is taken, so
-	// the snapshot arrives pre-wrapped for the screen it is about to fill.
-	if cols, rows, err := term.GetSize(int(os.Stdout.Fd())); err == nil {
-		_ = c.Resize(id, cols, rows)
-	}
-	attachment, err := c.Attach(id, 256)
+	result, err := c.Interactive(id, detachKey)
 	if err != nil {
 		return err
 	}
-	defer attachment.Close()
-
-	previous, err := term.MakeRaw(stdin)
-	if err != nil {
-		return err
+	switch result {
+	case client.Detached:
+		fmt.Fprintf(os.Stderr, "\r\n[detached: %s]\r\n", id)
+	case client.SessionExited:
+		fmt.Fprintf(os.Stderr, "\r\n[session exited: %s]\r\n", id)
+	case client.ConnectionLost:
+		fmt.Fprintf(os.Stderr, "\r\n[connection lost]\r\n")
 	}
-	defer term.Restore(stdin, previous)
-
-	snapshot := attachment.Snapshot()
-	// Clear, replay the exact state, and from here every byte is live.
-	os.Stdout.WriteString("\x1b[2J\x1b[H")
-	os.Stdout.Write(snapshot.ANSI)
-
-	winch := make(chan os.Signal, 1)
-	signal.Notify(winch, syscall.SIGWINCH)
-	defer signal.Stop(winch)
-
-	inputDone := make(chan struct{})
-	go func() {
-		defer close(inputDone)
-		buf := make([]byte, 4096)
-		for {
-			n, err := os.Stdin.Read(buf)
-			if n > 0 {
-				chunk := buf[:n]
-				if index := indexByte(chunk, detachKey); index >= 0 {
-					if index > 0 {
-						attachment.Write(chunk[:index])
-					}
-					return
-				}
-				if attachment.Write(chunk) != nil {
-					return
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	for {
-		select {
-		case <-inputDone:
-			fmt.Fprintf(os.Stderr, "\r\n[detached: %s]\r\n", id)
-			return nil
-		case <-winch:
-			if cols, rows, err := term.GetSize(int(os.Stdout.Fd())); err == nil {
-				_ = attachment.Resize(cols, rows)
-			}
-		case code := <-attachment.Exited():
-			fmt.Fprintf(os.Stderr, "\r\n[session exited: %d]\r\n", code)
-			return nil
-		case chunk, ok := <-attachment.Output():
-			if !ok {
-				fmt.Fprintf(os.Stderr, "\r\n[connection lost]\r\n")
-				return nil
-			}
-			os.Stdout.Write(chunk)
-		}
-	}
-}
-
-func indexByte(data []byte, target byte) int {
-	for index, value := range data {
-		if value == target {
-			return index
-		}
-	}
-	return -1
+	return nil
 }

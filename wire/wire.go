@@ -39,7 +39,7 @@ const MaxFrame = 32 << 20
 
 // Request is every control operation; Op selects which fields matter.
 type Request struct {
-	Op string `json:"op"` // spawn, list, info, kill, remove, resize, set_metadata
+	Op string `json:"op"` // spawn, list, info, kill, remove, resize, set_metadata, input, snapshot
 
 	// spawn
 	Command    string            `json:"command,omitempty"`
@@ -53,8 +53,12 @@ type Request struct {
 	Cols int `json:"cols,omitempty"`
 	Rows int `json:"rows,omitempty"`
 
-	// info, kill, remove, resize, set_metadata
+	// info, kill, remove, resize, set_metadata, input, snapshot
 	ID string `json:"id,omitempty"`
+
+	// input: terminal input bytes delivered without an attachment —
+	// automation writes this way; attachments are for watching.
+	Bytes []byte `json:"bytes,omitempty"`
 }
 
 // SessionInfo is what the daemon says about a session.
@@ -70,10 +74,11 @@ type SessionInfo struct {
 }
 
 type Response struct {
-	OK       bool          `json:"ok"`
-	Error    string        `json:"error,omitempty"`
-	Session  *SessionInfo  `json:"session,omitempty"`
-	Sessions []SessionInfo `json:"sessions,omitempty"`
+	OK       bool             `json:"ok"`
+	Error    string           `json:"error,omitempty"`
+	Session  *SessionInfo     `json:"session,omitempty"`
+	Sessions []SessionInfo    `json:"sessions,omitempty"`
+	Snapshot *SnapshotPayload `json:"snapshot,omitempty"`
 }
 
 type AttachRequest struct {

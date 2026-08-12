@@ -128,6 +128,26 @@ func handle(engine *windrunner.Engine, request wire.Request) wire.Response {
 		}
 		s.SetMetadata(request.Metadata)
 		return wire.Response{OK: true}
+	case "input":
+		s, ok := engine.Session(request.ID)
+		if !ok {
+			return wire.Response{Error: "no such session: " + request.ID}
+		}
+		if _, err := s.Write(request.Bytes); err != nil {
+			return wire.Response{Error: err.Error()}
+		}
+		return wire.Response{OK: true}
+	case "snapshot":
+		s, ok := engine.Session(request.ID)
+		if !ok {
+			return wire.Response{Error: "no such session: " + request.ID}
+		}
+		snapshot := s.Snapshot()
+		return wire.Response{OK: true, Snapshot: &wire.SnapshotPayload{
+			Cols: snapshot.Cols,
+			Rows: snapshot.Rows,
+			ANSI: snapshot.ANSI,
+		}}
 	default:
 		return wire.Response{Error: "unknown op: " + request.Op}
 	}
