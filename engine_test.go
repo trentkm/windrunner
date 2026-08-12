@@ -285,3 +285,18 @@ func TestQueryFloodWithDeafChildDoesNotWedgeTheEngine(t *testing.T) {
 		t.Fatalf("child never finished its flood:\n%s", sessionText(s))
 	}
 }
+
+// TestTitleSettingDoesNotDeadlock: OSC titles arrive through a callback
+// that fires inside emu.Write — under the session lock. The callback must
+// therefore never take the lock itself; the first real TUI (they all set
+// titles) proved this the hard way.
+func TestTitleSettingDoesNotDeadlock(t *testing.T) {
+	engine := newTestEngine(t)
+	s := spawnShell(t, engine, `printf '\033]2;herd of one\007'; printf 'titled\n'; sleep 60`)
+	waitFor(t, "output after title", func() bool {
+		return strings.Contains(sessionText(s), "titled")
+	})
+	if got := s.Title(); got != "herd of one" {
+		t.Fatalf("title = %q, want %q", got, "herd of one")
+	}
+}

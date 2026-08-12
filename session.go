@@ -124,9 +124,11 @@ func startSession(id string, spec SpawnSpec) (*Session, error) {
 	}
 	emu.SetCallbacks(vt.Callbacks{
 		Title: func(title string) {
-			s.mu.Lock()
+			// No lock: callbacks fire synchronously from inside emulator
+			// writes, and every emulator write in this file already holds
+			// mu — taking it here is self-deadlock, sprung by the first
+			// program that sets a title (they all do).
 			s.title = title
-			s.mu.Unlock()
 		},
 	})
 
