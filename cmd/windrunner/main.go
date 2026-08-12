@@ -7,6 +7,7 @@
 //	windrunner attach <id-prefix>
 //	windrunner peek [-ansi] <id-prefix>
 //	windrunner send <id-prefix> text...
+//	windrunner events [-json]
 //	windrunner kill <id-prefix>
 //	windrunner rm <id-prefix>
 //	windrunner daemon        (usually started for you)
@@ -19,9 +20,12 @@
 // therefore discover its peers (ls), read their screens, and prompt them.
 // Every send lands in the daemon's audit log, attributed to the sender's
 // own session when it has one (WINDRUNNER_SESSION, stamped at spawn).
+// events streams lifecycle and idle/busy signals, one line each — wait for
+// a peer to go idle instead of polling its screen.
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -61,6 +65,8 @@ func main() {
 		err = runPeek(os.Args[2:])
 	case "send":
 		err = runSend(os.Args[2:])
+	case "events":
+		err = runEvents(os.Args[2:])
 	case "kill":
 		err = withSession(os.Args[2:], func(c *client.Client, id string) error { return c.Kill(id) })
 	case "rm":
@@ -82,6 +88,7 @@ func usage() {
   windrunner attach <id-prefix>
   windrunner peek [-ansi] <id-prefix>
   windrunner send <id-prefix> text...
+  windrunner events [-json]
   windrunner kill <id-prefix>
   windrunner rm <id-prefix>
   windrunner daemon`)
@@ -298,6 +305,50 @@ func runSend(args []string) error {
 	return withSession(args[:1], func(c *client.Client, id string) error {
 		return c.Send(id, []byte(text), os.Getenv("WINDRUNNER_SESSION"))
 	})
+}
+
+// runEvents streams daemon events, one line per event, until the feed
+// ends. Plain lines are "type id [detail]"; -json emits the wire payloads
+// as JSON lines instead.
+func runEvents(args []string) error {
+	asJSON := false
+	if len(args) > 0 && args[0] == "-json" {
+		asJSON = true
+		args = args[1:]
+	}
+	if len(args) != 0 {
+		usage()
+		os.Exit(2)
+	}
+	c, err := connect()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	stream, err := c.Subscribe(256)
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+	for event := range stream.Events() {
+		if asJSON {
+			raw, err := json.Marshal(event)
+			if err != nil {
+				return err
+			}
+			fmt.Println(string(raw))
+			continue
+		}
+		line := event.Type + " " + event.SessionID
+		switch event.Type {
+		case "spawned":
+			line += "  " + event.Command
+		case "exited":
+			line += fmt.Sprintf("  code=%d", event.ExitCode)
+		}
+		fmt.Println(line)
+	}
+	return fmt.Errorf("event stream ended")
 }
 
 func runAttach(c *client.Client, id string) error {

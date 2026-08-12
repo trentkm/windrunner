@@ -243,6 +243,52 @@ func TestPeerInputIsOptIn(t *testing.T) {
 	drainUntil(t, a, "heard:attached")
 }
 
+func TestEventsOverTheWire(t *testing.T) {
+	c := startStack(t)
+	stream, err := c.Subscribe(64)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer stream.Close()
+
+	info, err := c.Spawn(wire.Request{
+		Command:     "/bin/sh",
+		Args:        []string{"-c", `printf 'hi\n'; sleep 60`},
+		Cols:        80,
+		Rows:        24,
+		IdleAfterMS: 50,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	next := func() wire.EventPayload {
+		t.Helper()
+		select {
+		case event, ok := <-stream.Events():
+			if !ok {
+				t.Fatal("event stream closed early")
+			}
+			return event
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for an event")
+		}
+		panic("unreachable")
+	}
+	if event := next(); event.Type != "spawned" || event.SessionID != info.ID || event.Command != "/bin/sh" {
+		t.Fatalf("first event should announce the spawn: %+v", event)
+	}
+	if event := next(); event.Type != "idle" || event.SessionID != info.ID {
+		t.Fatalf("expected idle once the greeting went quiet: %+v", event)
+	}
+	if err := c.Remove(info.ID); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	seen := map[string]bool{}
+	for !seen["exited"] || !seen["removed"] {
+		seen[next().Type] = true
+	}
+}
+
 // syncBuffer keeps the audit writer race-free against the test's reads.
 type syncBuffer struct {
 	mu sync.Mutex

@@ -38,6 +38,10 @@ extracted, embeddable, and unopinionated about what you build on top.
   as far as its process is concerned — and the daemon audit-logs every
   send, attributed via the `WINDRUNNER_SESSION` ID each child is spawned
   with. No stream-splicing: listening is snapshots, speaking is input.
+  For coordination beyond poke-and-peek, `windrunner events` streams the
+  daemon's pub/sub feed — session lifecycle plus idle/busy transitions —
+  so a peer can wait for a session to go quiet instead of polling its
+  screen.
 
 ## What it is not
 

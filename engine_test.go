@@ -184,6 +184,71 @@ func TestLaggedSubscriberIsDroppedNotBlocking(t *testing.T) {
 	})
 }
 
+func nextEvent(t *testing.T, sub *EventSubscription) Event {
+	t.Helper()
+	select {
+	case event, ok := <-sub.Events():
+		if !ok {
+			t.Fatal("event stream closed early")
+		}
+		return event
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for an event")
+	}
+	panic("unreachable")
+}
+
+// TestEventsTellTheSessionStory walks the pub/sub stream through a
+// session's whole life: spawned, quiet (idle), spoken to (busy), and
+// removed — the coordination signals richer than poke-and-peek.
+func TestEventsTellTheSessionStory(t *testing.T) {
+	engine := newTestEngine(t)
+	sub := engine.Subscribe(64)
+	defer sub.Close()
+
+	s, err := engine.Spawn(SpawnSpec{
+		Command:   "/bin/sh",
+		Args:      []string{"-c", `printf 'hi\n'; read line; printf 'again\n'; sleep 60`},
+		Cols:      80,
+		Rows:      24,
+		IdleAfter: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	if event := nextEvent(t, sub); event.Type != EventSpawned || event.SessionID != s.ID() || event.Command != "/bin/sh" {
+		t.Fatalf("first event should announce the spawn: %+v", event)
+	}
+	// Sessions start busy, so the greeting produces no event; the first
+	// activity signal is the session going quiet.
+	if event := nextEvent(t, sub); event.Type != EventIdle || event.SessionID != s.ID() {
+		t.Fatalf("expected idle after the greeting went quiet: %+v", event)
+	}
+	// Input wakes the child; its output is the busy transition.
+	if _, err := s.Write([]byte("wake\r")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if event := nextEvent(t, sub); event.Type != EventBusy || event.SessionID != s.ID() {
+		t.Fatalf("expected busy once output resumed: %+v", event)
+	}
+
+	// Remove kills the child; exited and removed both arrive, in
+	// whichever order the races land (idle may slip in beforehand).
+	engine.Remove(s.ID())
+	seen := map[EventType]bool{}
+	for !seen[EventExited] || !seen[EventRemoved] {
+		event := nextEvent(t, sub)
+		if event.SessionID != s.ID() {
+			t.Fatalf("event for a stranger: %+v", event)
+		}
+		if event.Type == EventExited && event.ExitCode == 0 {
+			t.Fatalf("SIGKILLed child reported exit code 0")
+		}
+		seen[event.Type] = true
+	}
+}
+
 // TestChildKnowsItsOwnSession: the engine stamps WINDRUNNER_SESSION into
 // each child's environment, so a process inside a session can name itself
 // to the control plane — the attribution behind audited peer sends.

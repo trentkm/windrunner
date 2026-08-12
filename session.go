@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/charmbracelet/x/vt"
 	"github.com/creack/pty"
@@ -23,6 +24,10 @@ import (
 // DefaultScrollback bounds each session's emulator history when SpawnSpec
 // does not say otherwise.
 const DefaultScrollback = 2000
+
+// DefaultIdleAfter is how long a session's terminal must stay quiet before
+// it is reported idle, when SpawnSpec does not say otherwise.
+const DefaultIdleAfter = 2 * time.Second
 
 // SpawnSpec describes a session to start. Cols and Rows are required; the
 // zero values of everything else are usable defaults.
@@ -41,6 +46,9 @@ type SpawnSpec struct {
 	// Scrollback caps emulator history in lines; 0 means
 	// DefaultScrollback.
 	Scrollback int
+	// IdleAfter is the quiet window behind idle/busy events: no output for
+	// this long means idle. 0 means DefaultIdleAfter.
+	IdleAfter time.Duration
 	// Peer opts the session into peer input: writes to its stdin that
 	// arrive without an attachment, the way automation and other sessions
 	// speak. The engine only stores the bit — Write never checks it; the
@@ -84,9 +92,17 @@ type Session struct {
 
 	cmd  *exec.Cmd
 	done chan struct{}
+
+	// Idle/busy events, published to the engine's subscribers. busy flips
+	// on output and idleTimer flips it back after idleAfter of quiet;
+	// publish is engine-provided and must be called without holding mu.
+	publish   func(Event)
+	busy      bool
+	idleAfter time.Duration
+	idleTimer *time.Timer
 }
 
-func startSession(id string, spec SpawnSpec) (*Session, error) {
+func startSession(id string, spec SpawnSpec, publish func(Event)) (*Session, error) {
 	if spec.Command == "" {
 		return nil, fmt.Errorf("windrunner: spawn needs a command")
 	}
@@ -96,6 +112,10 @@ func startSession(id string, spec SpawnSpec) (*Session, error) {
 	scrollback := spec.Scrollback
 	if scrollback == 0 {
 		scrollback = DefaultScrollback
+	}
+	idleAfter := spec.IdleAfter
+	if idleAfter == 0 {
+		idleAfter = DefaultIdleAfter
 	}
 
 	cmd := exec.Command(spec.Command, spec.Args...)
@@ -134,7 +154,14 @@ func startSession(id string, spec SpawnSpec) (*Session, error) {
 		ptyFile:  ptyFile,
 		cmd:      cmd,
 		done:     make(chan struct{}),
+		// Born busy: the process is presumably about to speak, and
+		// starting busy means the first event a subscriber sees is the
+		// meaningful one — the session going quiet.
+		publish:   publish,
+		busy:      true,
+		idleAfter: idleAfter,
 	}
+	s.idleTimer = time.AfterFunc(idleAfter, s.goIdle)
 	emu.SetCallbacks(vt.Callbacks{
 		Title: func(title string) {
 			// No lock: callbacks fire synchronously from inside emulator
@@ -180,11 +207,19 @@ func (s *Session) readLoop() {
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
 			s.mu.Lock()
+			// Output means busy; announce the transition only for a live
+			// child (post-exit PTY drain is an epilogue, not activity).
+			announce := !s.busy && !s.exited
+			s.busy = true
 			s.emu.Write(chunk)
 			for sub := range s.subs {
 				sub.deliver(chunk, s)
 			}
 			s.mu.Unlock()
+			s.idleTimer.Reset(s.idleAfter)
+			if announce {
+				s.publish(Event{Type: EventBusy, SessionID: s.id})
+			}
 		}
 		if err != nil {
 			s.mu.Lock()
@@ -256,7 +291,21 @@ func (s *Session) waitLoop() {
 	s.exited = true
 	s.exitCode = code
 	s.mu.Unlock()
+	// Exited is the terminal signal; a trailing idle would only echo it.
+	s.idleTimer.Stop()
 	close(s.done)
+}
+
+// goIdle fires when the terminal has been quiet for the idle window.
+func (s *Session) goIdle() {
+	s.mu.Lock()
+	if s.closed || s.exited || !s.busy {
+		s.mu.Unlock()
+		return
+	}
+	s.busy = false
+	s.mu.Unlock()
+	s.publish(Event{Type: EventIdle, SessionID: s.id})
 }
 
 // ID names the session; stable for its whole life.
@@ -411,6 +460,7 @@ func (s *Session) close() {
 	s.subs = make(map[*Subscription]struct{})
 	s.mu.Unlock()
 
+	s.idleTimer.Stop()
 	for sub := range subs {
 		sub.finish()
 	}

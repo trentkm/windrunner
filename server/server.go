@@ -11,6 +11,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/trentkm/windrunner"
 	"github.com/trentkm/windrunner/wire"
@@ -78,6 +79,16 @@ func serveConn(engine *windrunner.Engine, conn net.Conn, cfg config) {
 			// runs it to the end.
 			serveAttach(engine, conn, request)
 			return
+		case wire.FrameSubscribe:
+			var request wire.SubscribeRequest
+			if err := json.Unmarshal(payload, &request); err != nil {
+				respondError(conn, "malformed subscribe: "+err.Error())
+				return
+			}
+			// The connection is an event feed now; serveSubscribe runs
+			// it to the end.
+			serveSubscribe(engine, conn, request)
+			return
 		default:
 			respondError(conn, "unexpected frame before attach")
 			return
@@ -100,6 +111,7 @@ func handle(engine *windrunner.Engine, request wire.Request, cfg config) wire.Re
 			Cols:       request.Cols,
 			Rows:       request.Rows,
 			Scrollback: request.Scrollback,
+			IdleAfter:  time.Duration(request.IdleAfterMS) * time.Millisecond,
 			Metadata:   request.Metadata,
 			Peer:       request.Peer,
 		})
@@ -215,6 +227,40 @@ func (cfg config) auditSend(request wire.Request, outcome string) {
 	}
 	cfg.audit.Printf("send from=%s to=%s %s (%d bytes): %q%s",
 		from, request.ID, outcome, len(request.Bytes), text, truncated)
+}
+
+// serveSubscribe streams engine events over one connection: an ack first,
+// then one Event frame per event until the client hangs up, the engine
+// closes, or the subscriber lags.
+func serveSubscribe(engine *windrunner.Engine, conn net.Conn, request wire.SubscribeRequest) {
+	sub := engine.Subscribe(request.Buffer)
+	defer sub.Close()
+	if err := wire.WriteJSON(conn, wire.FrameResponse, wire.Response{OK: true}); err != nil {
+		return
+	}
+	// The client speaks only by hanging up; notice when it does.
+	go func() {
+		for {
+			if _, _, err := wire.ReadFrame(conn); err != nil {
+				sub.Close()
+				return
+			}
+		}
+	}()
+	for event := range sub.Events() {
+		err := wire.WriteJSON(conn, wire.FrameEvent, wire.EventPayload{
+			Type:      string(event.Type),
+			SessionID: event.SessionID,
+			Command:   event.Command,
+			ExitCode:  event.ExitCode,
+		})
+		if err != nil {
+			return
+		}
+	}
+	if sub.Lagged() {
+		respondError(conn, "event subscriber lagged; subscribe again")
+	}
 }
 
 // serveAttach streams one session over one connection: snapshot first,
