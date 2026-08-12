@@ -186,18 +186,42 @@ func (s *Session) readLoop() {
 // to queries (cursor position, device attributes) and in-band resize
 // reports for programs that asked for them. In a tap-based design these
 // bytes are garbage; owning the PTY is what makes them meaningful.
+//
+// The two halves are decoupled through an elastic queue, and that is not
+// an optimization: the emulator's response pipe is unbuffered and its
+// writes happen inside emu.Write — under the session lock. A child that
+// emits queries while not draining its own stdin (a busy TUI mid-burst)
+// blocks the PTY write; if that write were taken synchronously off the
+// pipe, the next response would block emu.Write, wedge the lock, and
+// freeze every List and Snapshot in the daemon behind one rude program.
+// Found with a real agent TUI, the hard way.
 func (s *Session) respondLoop() {
-	buf := make([]byte, 4096)
-	for {
-		n, err := s.emu.Read(buf)
-		if n > 0 {
-			s.writeMu.Lock()
-			_, writeErr := s.ptyFile.Write(buf[:n])
-			s.writeMu.Unlock()
-			if writeErr != nil {
+	responses := make(chan []byte, 256)
+	go func() {
+		defer close(responses)
+		buf := make([]byte, 4096)
+		for {
+			n, err := s.emu.Read(buf)
+			if n > 0 {
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				select {
+				case responses <- chunk:
+				default:
+					// The child has ignored its input long enough to
+					// back up 256 answers; late answers are worse than
+					// none.
+				}
+			}
+			if err != nil {
 				return
 			}
 		}
+	}()
+	for chunk := range responses {
+		s.writeMu.Lock()
+		_, err := s.ptyFile.Write(chunk)
+		s.writeMu.Unlock()
 		if err != nil {
 			return
 		}

@@ -247,3 +247,41 @@ func TestSnapshotReplaysIntoFreshEmulator(t *testing.T) {
 		t.Fatalf("replayed screen lost content:\n%s", stripANSI(echo))
 	}
 }
+
+// TestQueryFloodWithDeafChildDoesNotWedgeTheEngine reproduces the daemon
+// freeze found with a real agent TUI: a child that emits terminal queries
+// while never reading its stdin. Its input buffer fills, the response
+// writes block — and before the elastic response queue, that blocked the
+// emulator write under the session lock and froze every Snapshot behind
+// one rude program.
+func TestQueryFloodWithDeafChildDoesNotWedgeTheEngine(t *testing.T) {
+	engine := newTestEngine(t)
+	// 4000 cursor-position queries, stdin never read: each answer is ~8
+	// bytes against a kernel input queue of a few KB, so the PTY input
+	// side is guaranteed to jam.
+	// Raw mode is the load-bearing detail: canonical mode discards input
+	// when the queue fills, raw mode blocks the writer — and agent TUIs
+	// run raw.
+	s := spawnShell(t, engine,
+		`stty raw -echo; i=0; while [ $i -lt 4000 ]; do printf '\033[6n'; i=$((i+1)); done; printf 'flood done\r\n'; sleep 60`)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		deadline := time.Now().Add(15 * time.Second)
+		for !strings.Contains(sessionText(s), "flood done") {
+			if time.Now().After(deadline) {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("engine wedged: Snapshot never returned")
+	}
+	if !strings.Contains(sessionText(s), "flood done") {
+		t.Fatalf("child never finished its flood:\n%s", sessionText(s))
+	}
+}

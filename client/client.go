@@ -75,9 +75,15 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
+// callTimeout bounds every control call: a daemon that cannot answer in
+// this long is a daemon to report broken, not to wait on.
+const callTimeout = 10 * time.Second
+
 func (c *Client) call(request wire.Request) (wire.Response, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.conn.SetDeadline(time.Now().Add(callTimeout))
+	defer c.conn.SetDeadline(time.Time{})
 	if err := wire.WriteJSON(c.conn, wire.FrameControl, request); err != nil {
 		return wire.Response{}, err
 	}
