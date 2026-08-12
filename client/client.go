@@ -159,9 +159,17 @@ func (c *Client) SetMetadata(id string, metadata map[string]string) error {
 }
 
 // Input delivers terminal input without an attachment — the way
-// automation writes; attachments are for watching.
+// automation writes; attachments are for watching. The daemon refuses it
+// for sessions that were not spawned with peer access.
 func (c *Client) Input(id string, data []byte) error {
-	_, err := c.call(wire.Request{Op: "input", ID: id, Bytes: data})
+	return c.Send(id, data, "")
+}
+
+// Send is Input with attribution: from names the sender in the daemon's
+// audit trail, typically the sending session's own WINDRUNNER_SESSION.
+// It is recorded verbatim and grants nothing.
+func (c *Client) Send(id string, data []byte, from string) error {
+	_, err := c.call(wire.Request{Op: "input", ID: id, Bytes: data, From: from})
 	return err
 }
 

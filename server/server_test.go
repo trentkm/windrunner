@@ -1,11 +1,13 @@
 package server
 
 import (
+	"log"
 	"net"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,7 +22,7 @@ func stripANSI(text string) string {
 	return ansiPattern.ReplaceAllString(text, "")
 }
 
-func startStack(t *testing.T) *client.Client {
+func startStack(t *testing.T, options ...Option) *client.Client {
 	t.Helper()
 	// Not t.TempDir(): unix socket paths cap at 104 bytes on macOS, and
 	// long test names push the per-test dir past it.
@@ -36,7 +38,7 @@ func startStack(t *testing.T) *client.Client {
 	}
 	engine := windrunner.NewEngine()
 	t.Cleanup(engine.Close)
-	go Serve(engine, listener)
+	go Serve(engine, listener, options...)
 	t.Cleanup(func() { listener.Close() })
 
 	c, err := client.Dial(socket)
@@ -181,6 +183,7 @@ func TestInputAndSnapshotWithoutAttachment(t *testing.T) {
 		Args:    []string{"-c", `read line; printf 'heard:%s\n' "$line"; sleep 60`},
 		Cols:    80,
 		Rows:    24,
+		Peer:    true,
 	})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
@@ -201,5 +204,107 @@ func TestInputAndSnapshotWithoutAttachment(t *testing.T) {
 			t.Fatalf("input never landed:\n%s", stripANSI(string(snapshot.ANSI)))
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestPeerInputIsOptIn: sending into a session is remote code execution
+// as far as its process is concerned, so the detached input op must be
+// refused unless the session was spawned with peer access. Attachments
+// are unaffected either way.
+func TestPeerInputIsOptIn(t *testing.T) {
+	c := startStack(t)
+	info, err := c.Spawn(wire.Request{
+		Command: "/bin/sh",
+		Args:    []string{"-c", `read line; printf 'heard:%s\n' "$line"; sleep 60`},
+		Cols:    80,
+		Rows:    24,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if info.Peer {
+		t.Fatal("peer access must default off")
+	}
+	if err := c.Input(info.ID, []byte("intruder\r")); err == nil {
+		t.Fatal("detached input into a non-peer session must be refused")
+	} else if !strings.Contains(err.Error(), "peer") {
+		t.Fatalf("refusal should say why: %v", err)
+	}
+
+	// The gate is the op, not the session: an attachment still speaks.
+	a, err := c.Attach(info.ID, 64)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	defer a.Close()
+	if err := a.Write([]byte("attached\r")); err != nil {
+		t.Fatalf("attached input should not be gated: %v", err)
+	}
+	drainUntil(t, a, "heard:attached")
+}
+
+// syncBuffer keeps the audit writer race-free against the test's reads.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+func TestAuditTrailRecordsSends(t *testing.T) {
+	var audit syncBuffer
+	c := startStack(t, WithAudit(log.New(&audit, "", 0)))
+
+	open, err := c.Spawn(wire.Request{
+		Command: "/bin/sh",
+		Args:    []string{"-c", `sleep 60`},
+		Cols:    80,
+		Rows:    24,
+		Peer:    true,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	closed, err := c.Spawn(wire.Request{
+		Command: "/bin/sh",
+		Args:    []string{"-c", `sleep 60`},
+		Cols:    80,
+		Rows:    24,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	if err := c.Send(open.ID, []byte("hello over there\r"), "sender-session"); err != nil {
+		t.Fatalf("Send to peer session: %v", err)
+	}
+	if err := c.Send(closed.ID, []byte("psst\r"), "sender-session"); err == nil {
+		t.Fatal("Send to non-peer session must fail")
+	}
+	if err := c.Input(open.ID, []byte("anon\r")); err != nil {
+		t.Fatalf("unattributed Input: %v", err)
+	}
+
+	// The client call returns only after handle wrote the audit line, so
+	// the trail is complete the moment the sends are.
+	trail := audit.String()
+	for _, want := range []string{
+		"from=sender-session to=" + open.ID + " delivered (17 bytes): \"hello over there\\r\"",
+		"from=sender-session to=" + closed.ID + " refused: no peer access",
+		"from=unattributed to=" + open.ID + " delivered",
+	} {
+		if !strings.Contains(trail, want) {
+			t.Fatalf("audit trail missing %q:\n%s", want, trail)
+		}
 	}
 }

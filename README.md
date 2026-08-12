@@ -30,6 +30,14 @@ extracted, embeddable, and unopinionated about what you build on top.
 - **Sessions carry opaque metadata.** Tag sessions with whatever your
   product means by them — task, branch, agent, owner. Windrunner stores and
   returns the bag; it never interprets it.
+- **Sessions can talk — deliberately.** `windrunner ls`, `peek <id>`
+  (print a session's rendered screen), and `send <id> text...` (type text
+  plus Enter) are a control plane any program with a shell can drive:
+  discover peers, read their screens, prompt them. Speaking is opt-in per
+  session (`new -peer`) — writing into a session's stdin is code execution
+  as far as its process is concerned — and the daemon audit-logs every
+  send, attributed via the `WINDRUNNER_SESSION` ID each child is spawned
+  with. No stream-splicing: listening is snapshots, speaking is input.
 
 ## What it is not
 

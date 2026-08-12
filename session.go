@@ -33,12 +33,20 @@ type SpawnSpec struct {
 	// Env is the child's environment; nil inherits the engine process's.
 	// TERM is set to xterm-256color unless the caller provides one — the
 	// child must describe output for the terminal windrunner actually
-	// emulates.
+	// emulates. WINDRUNNER_SESSION is set to the session's ID unless the
+	// caller provides one, so a session's process can name itself to the
+	// control plane.
 	Env        []string
 	Cols, Rows int
 	// Scrollback caps emulator history in lines; 0 means
 	// DefaultScrollback.
 	Scrollback int
+	// Peer opts the session into peer input: writes to its stdin that
+	// arrive without an attachment, the way automation and other sessions
+	// speak. The engine only stores the bit — Write never checks it; the
+	// server package refuses the detached input op for sessions that did
+	// not opt in.
+	Peer bool
 	// Metadata travels with the session verbatim. The engine stores and
 	// returns it; it never reads it.
 	Metadata map[string]string
@@ -55,7 +63,8 @@ type Snapshot struct {
 // Session is one process on one PTY, with the authoritative record of what
 // its terminal looks like. All methods are safe for concurrent use.
 type Session struct {
-	id string
+	id   string
+	peer bool
 
 	mu       sync.Mutex
 	emu      *vt.Emulator
@@ -95,8 +104,11 @@ func startSession(id string, spec SpawnSpec) (*Session, error) {
 	if env == nil {
 		env = os.Environ()
 	}
-	if !envHasTerm(env) {
+	if !envHas(env, "TERM") {
 		env = append(env, "TERM=xterm-256color")
+	}
+	if !envHas(env, "WINDRUNNER_SESSION") {
+		env = append(env, "WINDRUNNER_SESSION="+id)
 	}
 	cmd.Env = env
 
@@ -113,6 +125,7 @@ func startSession(id string, spec SpawnSpec) (*Session, error) {
 
 	s := &Session{
 		id:       id,
+		peer:     spec.Peer,
 		emu:      emu,
 		metadata: cloneMetadata(spec.Metadata),
 		cols:     spec.Cols,
@@ -138,9 +151,10 @@ func startSession(id string, spec SpawnSpec) (*Session, error) {
 	return s, nil
 }
 
-func envHasTerm(env []string) bool {
+func envHas(env []string, name string) bool {
+	prefix := name + "="
 	for _, entry := range env {
-		if strings.HasPrefix(entry, "TERM=") {
+		if strings.HasPrefix(entry, prefix) {
 			return true
 		}
 	}
@@ -247,6 +261,11 @@ func (s *Session) waitLoop() {
 
 // ID names the session; stable for its whole life.
 func (s *Session) ID() string { return s.id }
+
+// Peer reports whether the session opted into peer input at spawn.
+// Immutable for the session's life — a guardrail that could be flipped
+// after the fact would not be one.
+func (s *Session) Peer() bool { return s.peer }
 
 // Metadata returns a copy of the session's opaque tag bag.
 func (s *Session) Metadata() map[string]string {

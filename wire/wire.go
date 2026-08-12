@@ -48,6 +48,11 @@ type Request struct {
 	Env        []string          `json:"env,omitempty"`
 	Scrollback int               `json:"scrollback,omitempty"`
 	Metadata   map[string]string `json:"metadata,omitempty"`
+	// spawn: opt the session into peer input. Sessions that did not opt
+	// in refuse the input op — sending into a session is remote code
+	// execution as far as its process is concerned, so it is off unless
+	// asked for.
+	Peer bool `json:"peer,omitempty"`
 
 	// spawn, resize
 	Cols int `json:"cols,omitempty"`
@@ -59,6 +64,11 @@ type Request struct {
 	// input: terminal input bytes delivered without an attachment —
 	// automation writes this way; attachments are for watching.
 	Bytes []byte `json:"bytes,omitempty"`
+
+	// input: self-declared sender identity for the daemon's audit trail,
+	// typically the sending session's own ID (WINDRUNNER_SESSION). The
+	// daemon records it verbatim; it grants nothing.
+	From string `json:"from,omitempty"`
 }
 
 // SessionInfo is what the daemon says about a session.
@@ -70,6 +80,7 @@ type SessionInfo struct {
 	Cols     int               `json:"cols"`
 	Rows     int               `json:"rows"`
 	Title    string            `json:"title,omitempty"`
+	Peer     bool              `json:"peer,omitempty"`
 	Metadata map[string]string `json:"metadata,omitempty"`
 }
 

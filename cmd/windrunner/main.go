@@ -2,24 +2,36 @@
 // terminal sessions you can create, list, and attach to — a minimal
 // screen alternative that doubles as a demo of the library.
 //
-//	windrunner new [-name label] -- command args...
+//	windrunner new [-name label] [-peer] -- command args...
 //	windrunner ls
 //	windrunner attach <id-prefix>
+//	windrunner peek [-ansi] <id-prefix>
+//	windrunner send <id-prefix> text...
 //	windrunner kill <id-prefix>
 //	windrunner rm <id-prefix>
 //	windrunner daemon        (usually started for you)
 //
 // Detach from an attached session with ctrl+q.
+//
+// peek and send are the agent-facing control plane: peek prints a
+// session's rendered screen and exits, send types text plus Enter into a
+// session that opted in with -peer. A program that can run a shell can
+// therefore discover its peers (ls), read their screens, and prompt them.
+// Every send lands in the daemon's audit log, attributed to the sender's
+// own session when it has one (WINDRUNNER_SESSION, stamped at spawn).
 package main
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/x/vt"
 	"golang.org/x/term"
 
 	"github.com/trentkm/windrunner"
@@ -45,6 +57,10 @@ func main() {
 		err = runList()
 	case "attach":
 		err = withSession(os.Args[2:], runAttach)
+	case "peek":
+		err = runPeek(os.Args[2:])
+	case "send":
+		err = runSend(os.Args[2:])
 	case "kill":
 		err = withSession(os.Args[2:], func(c *client.Client, id string) error { return c.Kill(id) })
 	case "rm":
@@ -61,9 +77,11 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  windrunner new [-name label] -- command args...
+  windrunner new [-name label] [-peer] -- command args...
   windrunner ls
   windrunner attach <id-prefix>
+  windrunner peek [-ansi] <id-prefix>
+  windrunner send <id-prefix> text...
   windrunner kill <id-prefix>
   windrunner rm <id-prefix>
   windrunner daemon`)
@@ -86,6 +104,14 @@ func socketPath() string {
 
 func runDaemon() error {
 	path := socketPath()
+	// The audit log is a guardrail, not a nicety: a daemon that cannot
+	// record who sent what refuses to run rather than running silent.
+	auditFile, err := os.OpenFile(filepath.Join(filepath.Dir(path), "audit.log"),
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open audit log: %w", err)
+	}
+	defer auditFile.Close()
 	os.Remove(path)
 	listener, err := net.Listen("unix", path)
 	if err != nil {
@@ -94,7 +120,8 @@ func runDaemon() error {
 	defer os.Remove(path)
 	engine := windrunner.NewEngine()
 	defer engine.Close()
-	return server.Serve(engine, listener)
+	audit := log.New(auditFile, "", log.LstdFlags|log.Lmicroseconds)
+	return server.Serve(engine, listener, server.WithAudit(audit))
 }
 
 func connect() (*client.Client, error) {
@@ -155,20 +182,32 @@ func runList() error {
 		if !info.Alive {
 			state = fmt.Sprintf("exited(%d)", info.ExitCode)
 		}
+		peer := "-"
+		if info.Peer {
+			peer = "peer"
+		}
 		label := info.Metadata["name"]
 		if label == "" {
 			label = info.Title
 		}
-		fmt.Printf("%s  %-10s %dx%d  %s\n", info.ID, state, info.Cols, info.Rows, label)
+		fmt.Printf("%s  %-10s %-4s  %dx%d  %s\n", info.ID, state, peer, info.Cols, info.Rows, label)
 	}
 	return nil
 }
 
 func runNew(args []string) error {
 	name := ""
-	if len(args) >= 2 && args[0] == "-name" {
-		name = args[1]
-		args = args[2:]
+	peer := false
+	for len(args) > 0 {
+		if args[0] == "-name" && len(args) >= 2 {
+			name = args[1]
+			args = args[2:]
+		} else if args[0] == "-peer" {
+			peer = true
+			args = args[1:]
+		} else {
+			break
+		}
 	}
 	if len(args) > 0 && args[0] == "--" {
 		args = args[1:]
@@ -201,12 +240,64 @@ func runNew(args []string) error {
 		Dir:      dir,
 		Cols:     cols,
 		Rows:     rows,
+		Peer:     peer,
 		Metadata: metadata,
 	})
 	if err != nil {
 		return err
 	}
 	return runAttach(c, info.ID)
+}
+
+var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07`)
+
+// runPeek prints a session's screen and exits: listening without
+// attaching. The default output is the visible screen as plain text — the
+// shape an agent reads well — produced by replaying the snapshot into a
+// fresh emulator. -ansi prints the exact snapshot bytes instead
+// (scrollback, styling, cursor), for piping into a renderer.
+func runPeek(args []string) error {
+	ansi := false
+	if len(args) > 0 && args[0] == "-ansi" {
+		ansi = true
+		args = args[1:]
+	}
+	return withSession(args, func(c *client.Client, id string) error {
+		snapshot, err := c.Snapshot(id)
+		if err != nil {
+			return err
+		}
+		if ansi {
+			_, err := os.Stdout.Write(snapshot.ANSI)
+			return err
+		}
+		emu := vt.NewEmulator(snapshot.Cols, snapshot.Rows)
+		emu.Write(snapshot.ANSI)
+		lines := strings.Split(ansiPattern.ReplaceAllString(emu.Render(), ""), "\n")
+		for i := range lines {
+			lines[i] = strings.TrimRight(lines[i], " \t\r")
+		}
+		for len(lines) > 0 && lines[len(lines)-1] == "" {
+			lines = lines[:len(lines)-1]
+		}
+		fmt.Println(strings.Join(lines, "\n"))
+		return nil
+	})
+}
+
+// runSend types text plus Enter into a session — speaking without
+// attaching. The target must have been spawned with -peer; the daemon
+// audit-logs the send either way, attributed to this process's own
+// session if it is running inside one.
+func runSend(args []string) error {
+	if len(args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+	text := strings.Join(args[1:], " ") + "\r"
+	return withSession(args[:1], func(c *client.Client, id string) error {
+		return c.Send(id, []byte(text), os.Getenv("WINDRUNNER_SESSION"))
+	})
 }
 
 func runAttach(c *client.Client, id string) error {

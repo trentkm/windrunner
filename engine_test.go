@@ -184,6 +184,17 @@ func TestLaggedSubscriberIsDroppedNotBlocking(t *testing.T) {
 	})
 }
 
+// TestChildKnowsItsOwnSession: the engine stamps WINDRUNNER_SESSION into
+// each child's environment, so a process inside a session can name itself
+// to the control plane — the attribution behind audited peer sends.
+func TestChildKnowsItsOwnSession(t *testing.T) {
+	engine := newTestEngine(t)
+	s := spawnShell(t, engine, `printf 'sid:%s:end\n' "$WINDRUNNER_SESSION"; sleep 60`)
+	waitFor(t, "session id in child env", func() bool {
+		return strings.Contains(sessionText(s), "sid:"+s.ID()+":end")
+	})
+}
+
 func TestMetadataRoundTrips(t *testing.T) {
 	engine := newTestEngine(t)
 	s, err := engine.Spawn(SpawnSpec{
