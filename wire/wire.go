@@ -1,5 +1,5 @@
 // Package wire is windrunner's socket protocol: length-prefixed frames
-// over a unix socket. Two connection styles share one framing:
+// over a unix socket. Three connection styles share one framing:
 //
 //   - A control connection carries JSON requests and responses (spawn,
 //     list, kill, remove, resize, metadata).
@@ -7,6 +7,10 @@
 //     Attach, the server answers with a Snapshot, and from then on the
 //     server streams Output frames while the client sends Input and
 //     Resize. Closing the connection is detaching.
+//   - A subscribe connection is a feed of engine events: the client sends
+//     Subscribe, the server acks with a Response, and from then on the
+//     server streams Event frames — session lifecycle and idle/busy
+//     transitions. Closing the connection unsubscribes.
 //
 // Frames are: 1 type byte, 4 length bytes (big endian), payload. Output
 // and Input payloads are raw terminal bytes; everything else is JSON.
@@ -29,8 +33,10 @@ const (
 	FrameOutput   FrameType = 5 // raw terminal output
 	FrameInput    FrameType = 6 // raw terminal input
 	FrameResize   FrameType = 7 // JSON ResizePayload
-	FrameExited   FrameType = 8 // JSON ExitedPayload
-	FrameError    FrameType = 9 // JSON ErrorPayload
+	FrameExited    FrameType = 8  // JSON ExitedPayload
+	FrameError     FrameType = 9  // JSON ErrorPayload
+	FrameSubscribe FrameType = 10 // JSON SubscribeRequest
+	FrameEvent     FrameType = 11 // JSON EventPayload
 )
 
 // MaxFrame bounds a single frame; snapshots of deep scrollback are the
@@ -48,6 +54,14 @@ type Request struct {
 	Env        []string          `json:"env,omitempty"`
 	Scrollback int               `json:"scrollback,omitempty"`
 	Metadata   map[string]string `json:"metadata,omitempty"`
+	// spawn: quiet window in milliseconds behind idle/busy events; 0
+	// means the engine default.
+	IdleAfterMS int `json:"idle_after_ms,omitempty"`
+	// spawn: opt the session into peer input. Sessions that did not opt
+	// in refuse the input op — sending into a session is remote code
+	// execution as far as its process is concerned, so it is off unless
+	// asked for.
+	Peer bool `json:"peer,omitempty"`
 
 	// spawn, resize
 	Cols int `json:"cols,omitempty"`
@@ -59,6 +73,11 @@ type Request struct {
 	// input: terminal input bytes delivered without an attachment —
 	// automation writes this way; attachments are for watching.
 	Bytes []byte `json:"bytes,omitempty"`
+
+	// input: self-declared sender identity for the daemon's audit trail,
+	// typically the sending session's own ID (WINDRUNNER_SESSION). The
+	// daemon records it verbatim; it grants nothing.
+	From string `json:"from,omitempty"`
 }
 
 // SessionInfo is what the daemon says about a session.
@@ -70,6 +89,7 @@ type SessionInfo struct {
 	Cols     int               `json:"cols"`
 	Rows     int               `json:"rows"`
 	Title    string            `json:"title,omitempty"`
+	Peer     bool              `json:"peer,omitempty"`
 	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
@@ -92,6 +112,20 @@ type SnapshotPayload struct {
 	Cols int    `json:"cols"`
 	Rows int    `json:"rows"`
 	ANSI []byte `json:"ansi"`
+}
+
+type SubscribeRequest struct {
+	// Buffer is the subscriber's event buffer; falling behind it means
+	// being dropped and re-subscribing.
+	Buffer int `json:"buffer,omitempty"`
+}
+
+// EventPayload is one engine event: spawned, exited, removed, idle, busy.
+type EventPayload struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id"`
+	Command   string `json:"command,omitempty"`   // spawned
+	ExitCode  int    `json:"exit_code,omitempty"` // exited
 }
 
 type ResizePayload struct {

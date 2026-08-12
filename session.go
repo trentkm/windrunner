@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/charmbracelet/x/vt"
 	"github.com/creack/pty"
@@ -23,6 +24,10 @@ import (
 // DefaultScrollback bounds each session's emulator history when SpawnSpec
 // does not say otherwise.
 const DefaultScrollback = 2000
+
+// DefaultIdleAfter is how long a session's terminal must stay quiet before
+// it is reported idle, when SpawnSpec does not say otherwise.
+const DefaultIdleAfter = 2 * time.Second
 
 // SpawnSpec describes a session to start. Cols and Rows are required; the
 // zero values of everything else are usable defaults.
@@ -33,12 +38,23 @@ type SpawnSpec struct {
 	// Env is the child's environment; nil inherits the engine process's.
 	// TERM is set to xterm-256color unless the caller provides one — the
 	// child must describe output for the terminal windrunner actually
-	// emulates.
+	// emulates. WINDRUNNER_SESSION is set to the session's ID unless the
+	// caller provides one, so a session's process can name itself to the
+	// control plane.
 	Env        []string
 	Cols, Rows int
 	// Scrollback caps emulator history in lines; 0 means
 	// DefaultScrollback.
 	Scrollback int
+	// IdleAfter is the quiet window behind idle/busy events: no output for
+	// this long means idle. 0 means DefaultIdleAfter.
+	IdleAfter time.Duration
+	// Peer opts the session into peer input: writes to its stdin that
+	// arrive without an attachment, the way automation and other sessions
+	// speak. The engine only stores the bit — Write never checks it; the
+	// server package refuses the detached input op for sessions that did
+	// not opt in.
+	Peer bool
 	// Metadata travels with the session verbatim. The engine stores and
 	// returns it; it never reads it.
 	Metadata map[string]string
@@ -55,7 +71,8 @@ type Snapshot struct {
 // Session is one process on one PTY, with the authoritative record of what
 // its terminal looks like. All methods are safe for concurrent use.
 type Session struct {
-	id string
+	id   string
+	peer bool
 
 	mu       sync.Mutex
 	emu      *vt.Emulator
@@ -75,9 +92,17 @@ type Session struct {
 
 	cmd  *exec.Cmd
 	done chan struct{}
+
+	// Idle/busy events, published to the engine's subscribers. busy flips
+	// on output and idleTimer flips it back after idleAfter of quiet;
+	// publish is engine-provided and must be called without holding mu.
+	publish   func(Event)
+	busy      bool
+	idleAfter time.Duration
+	idleTimer *time.Timer
 }
 
-func startSession(id string, spec SpawnSpec) (*Session, error) {
+func startSession(id string, spec SpawnSpec, publish func(Event)) (*Session, error) {
 	if spec.Command == "" {
 		return nil, fmt.Errorf("windrunner: spawn needs a command")
 	}
@@ -88,6 +113,10 @@ func startSession(id string, spec SpawnSpec) (*Session, error) {
 	if scrollback == 0 {
 		scrollback = DefaultScrollback
 	}
+	idleAfter := spec.IdleAfter
+	if idleAfter == 0 {
+		idleAfter = DefaultIdleAfter
+	}
 
 	cmd := exec.Command(spec.Command, spec.Args...)
 	cmd.Dir = spec.Dir
@@ -95,8 +124,11 @@ func startSession(id string, spec SpawnSpec) (*Session, error) {
 	if env == nil {
 		env = os.Environ()
 	}
-	if !envHasTerm(env) {
+	if !envHas(env, "TERM") {
 		env = append(env, "TERM=xterm-256color")
+	}
+	if !envHas(env, "WINDRUNNER_SESSION") {
+		env = append(env, "WINDRUNNER_SESSION="+id)
 	}
 	cmd.Env = env
 
@@ -113,6 +145,7 @@ func startSession(id string, spec SpawnSpec) (*Session, error) {
 
 	s := &Session{
 		id:       id,
+		peer:     spec.Peer,
 		emu:      emu,
 		metadata: cloneMetadata(spec.Metadata),
 		cols:     spec.Cols,
@@ -121,7 +154,14 @@ func startSession(id string, spec SpawnSpec) (*Session, error) {
 		ptyFile:  ptyFile,
 		cmd:      cmd,
 		done:     make(chan struct{}),
+		// Born busy: the process is presumably about to speak, and
+		// starting busy means the first event a subscriber sees is the
+		// meaningful one — the session going quiet.
+		publish:   publish,
+		busy:      true,
+		idleAfter: idleAfter,
 	}
+	s.idleTimer = time.AfterFunc(idleAfter, s.goIdle)
 	emu.SetCallbacks(vt.Callbacks{
 		Title: func(title string) {
 			// No lock: callbacks fire synchronously from inside emulator
@@ -138,9 +178,10 @@ func startSession(id string, spec SpawnSpec) (*Session, error) {
 	return s, nil
 }
 
-func envHasTerm(env []string) bool {
+func envHas(env []string, name string) bool {
+	prefix := name + "="
 	for _, entry := range env {
-		if strings.HasPrefix(entry, "TERM=") {
+		if strings.HasPrefix(entry, prefix) {
 			return true
 		}
 	}
@@ -166,11 +207,19 @@ func (s *Session) readLoop() {
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
 			s.mu.Lock()
+			// Output means busy; announce the transition only for a live
+			// child (post-exit PTY drain is an epilogue, not activity).
+			announce := !s.busy && !s.exited
+			s.busy = true
 			s.emu.Write(chunk)
 			for sub := range s.subs {
 				sub.deliver(chunk, s)
 			}
 			s.mu.Unlock()
+			s.idleTimer.Reset(s.idleAfter)
+			if announce {
+				s.publish(Event{Type: EventBusy, SessionID: s.id})
+			}
 		}
 		if err != nil {
 			s.mu.Lock()
@@ -242,11 +291,30 @@ func (s *Session) waitLoop() {
 	s.exited = true
 	s.exitCode = code
 	s.mu.Unlock()
+	// Exited is the terminal signal; a trailing idle would only echo it.
+	s.idleTimer.Stop()
 	close(s.done)
+}
+
+// goIdle fires when the terminal has been quiet for the idle window.
+func (s *Session) goIdle() {
+	s.mu.Lock()
+	if s.closed || s.exited || !s.busy {
+		s.mu.Unlock()
+		return
+	}
+	s.busy = false
+	s.mu.Unlock()
+	s.publish(Event{Type: EventIdle, SessionID: s.id})
 }
 
 // ID names the session; stable for its whole life.
 func (s *Session) ID() string { return s.id }
+
+// Peer reports whether the session opted into peer input at spawn.
+// Immutable for the session's life — a guardrail that could be flipped
+// after the fact would not be one.
+func (s *Session) Peer() bool { return s.peer }
 
 // Metadata returns a copy of the session's opaque tag bag.
 func (s *Session) Metadata() map[string]string {
@@ -392,6 +460,7 @@ func (s *Session) close() {
 	s.subs = make(map[*Subscription]struct{})
 	s.mu.Unlock()
 
+	s.idleTimer.Stop()
 	for sub := range subs {
 		sub.finish()
 	}

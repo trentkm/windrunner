@@ -159,9 +159,17 @@ func (c *Client) SetMetadata(id string, metadata map[string]string) error {
 }
 
 // Input delivers terminal input without an attachment — the way
-// automation writes; attachments are for watching.
+// automation writes; attachments are for watching. The daemon refuses it
+// for sessions that were not spawned with peer access.
 func (c *Client) Input(id string, data []byte) error {
-	_, err := c.call(wire.Request{Op: "input", ID: id, Bytes: data})
+	return c.Send(id, data, "")
+}
+
+// Send is Input with attribution: from names the sender in the daemon's
+// audit trail, typically the sending session's own WINDRUNNER_SESSION.
+// It is recorded verbatim and grants nothing.
+func (c *Client) Send(id string, data []byte, from string) error {
+	_, err := c.call(wire.Request{Op: "input", ID: id, Bytes: data, From: from})
 	return err
 }
 
@@ -172,6 +180,74 @@ func (c *Client) Snapshot(id string) (wire.SnapshotPayload, error) {
 		return wire.SnapshotPayload{}, err
 	}
 	return *response.Snapshot, nil
+}
+
+// EventStream is a live feed of engine events, on its own connection.
+type EventStream struct {
+	conn   net.Conn
+	events chan wire.EventPayload
+	once   sync.Once
+}
+
+// Subscribe opens a dedicated connection to the daemon's event feed:
+// session lifecycle (spawned, exited, removed) and activity (idle, busy).
+// It returns once the daemon has acked, so no event after that is missed.
+func (c *Client) Subscribe(buffer int) (*EventStream, error) {
+	conn, err := net.Dial("unix", c.socketPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := wire.WriteJSON(conn, wire.FrameSubscribe, wire.SubscribeRequest{Buffer: buffer}); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	frameType, payload, err := wire.ReadFrame(conn)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if frameType == wire.FrameError {
+		var failure wire.ErrorPayload
+		_ = json.Unmarshal(payload, &failure)
+		conn.Close()
+		return nil, fmt.Errorf("windrunner: %s", failure.Error)
+	}
+	if frameType != wire.FrameResponse {
+		conn.Close()
+		return nil, fmt.Errorf("windrunner: expected subscribe ack, got frame %d", frameType)
+	}
+	stream := &EventStream{conn: conn, events: make(chan wire.EventPayload, 64)}
+	go stream.readLoop()
+	return stream, nil
+}
+
+// Events yields engine events. The channel closes when the stream ends:
+// Close, a daemon gone away, or the subscription dropped for lagging.
+func (stream *EventStream) Events() <-chan wire.EventPayload { return stream.events }
+
+// Close unsubscribes.
+func (stream *EventStream) Close() {
+	stream.once.Do(func() { stream.conn.Close() })
+}
+
+func (stream *EventStream) readLoop() {
+	defer close(stream.events)
+	for {
+		frameType, payload, err := wire.ReadFrame(stream.conn)
+		if err != nil {
+			return
+		}
+		if frameType != wire.FrameEvent {
+			// An error frame (lagged) or an unknown future frame; either
+			// way the feed is over or unintelligible — end it.
+			return
+		}
+		var event wire.EventPayload
+		if err := json.Unmarshal(payload, &event); err != nil {
+			return
+		}
+		stream.events <- event
+	}
 }
 
 // Attachment is one live view of one session, on its own connection.

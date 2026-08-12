@@ -7,17 +7,39 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net"
+	"strconv"
 	"sync"
+	"time"
 
 	"github.com/trentkm/windrunner"
 	"github.com/trentkm/windrunner/wire"
 )
 
+// Option adjusts how Serve runs.
+type Option func(*config)
+
+type config struct {
+	audit *log.Logger
+}
+
+// WithAudit routes the audit trail to logger: one line per detached input
+// op — delivered, refused, or failed — with the self-declared sender, the
+// target, and the bytes. When sessions talk to each other, this is the
+// transcript of who said what.
+func WithAudit(logger *log.Logger) Option {
+	return func(cfg *config) { cfg.audit = logger }
+}
+
 // Serve accepts connections until the listener closes. Each connection
 // declares itself with its first frame: control connections stay in a
 // request loop, attach connections become one session's stream.
-func Serve(engine *windrunner.Engine, listener net.Listener) error {
+func Serve(engine *windrunner.Engine, listener net.Listener, options ...Option) error {
+	var cfg config
+	for _, option := range options {
+		option(&cfg)
+	}
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -26,11 +48,11 @@ func Serve(engine *windrunner.Engine, listener net.Listener) error {
 			}
 			return err
 		}
-		go serveConn(engine, conn)
+		go serveConn(engine, conn, cfg)
 	}
 }
 
-func serveConn(engine *windrunner.Engine, conn net.Conn) {
+func serveConn(engine *windrunner.Engine, conn net.Conn, cfg config) {
 	defer conn.Close()
 	for {
 		frameType, payload, err := wire.ReadFrame(conn)
@@ -44,7 +66,7 @@ func serveConn(engine *windrunner.Engine, conn net.Conn) {
 				respondError(conn, "malformed request: "+err.Error())
 				return
 			}
-			if err := wire.WriteJSON(conn, wire.FrameResponse, handle(engine, request)); err != nil {
+			if err := wire.WriteJSON(conn, wire.FrameResponse, handle(engine, request, cfg)); err != nil {
 				return
 			}
 		case wire.FrameAttach:
@@ -57,6 +79,16 @@ func serveConn(engine *windrunner.Engine, conn net.Conn) {
 			// runs it to the end.
 			serveAttach(engine, conn, request)
 			return
+		case wire.FrameSubscribe:
+			var request wire.SubscribeRequest
+			if err := json.Unmarshal(payload, &request); err != nil {
+				respondError(conn, "malformed subscribe: "+err.Error())
+				return
+			}
+			// The connection is an event feed now; serveSubscribe runs
+			// it to the end.
+			serveSubscribe(engine, conn, request)
+			return
 		default:
 			respondError(conn, "unexpected frame before attach")
 			return
@@ -68,7 +100,7 @@ func respondError(conn net.Conn, message string) {
 	_ = wire.WriteJSON(conn, wire.FrameError, wire.ErrorPayload{Error: message})
 }
 
-func handle(engine *windrunner.Engine, request wire.Request) wire.Response {
+func handle(engine *windrunner.Engine, request wire.Request, cfg config) wire.Response {
 	switch request.Op {
 	case "spawn":
 		s, err := engine.Spawn(windrunner.SpawnSpec{
@@ -79,7 +111,9 @@ func handle(engine *windrunner.Engine, request wire.Request) wire.Response {
 			Cols:       request.Cols,
 			Rows:       request.Rows,
 			Scrollback: request.Scrollback,
+			IdleAfter:  time.Duration(request.IdleAfterMS) * time.Millisecond,
 			Metadata:   request.Metadata,
+			Peer:       request.Peer,
 		})
 		if err != nil {
 			return wire.Response{Error: err.Error()}
@@ -133,9 +167,15 @@ func handle(engine *windrunner.Engine, request wire.Request) wire.Response {
 		if !ok {
 			return wire.Response{Error: "no such session: " + request.ID}
 		}
+		if !s.Peer() {
+			cfg.auditSend(request, "refused: no peer access")
+			return wire.Response{Error: "session " + request.ID + " does not accept peer input (opt in at spawn)"}
+		}
 		if _, err := s.Write(request.Bytes); err != nil {
+			cfg.auditSend(request, "failed: "+err.Error())
 			return wire.Response{Error: err.Error()}
 		}
+		cfg.auditSend(request, "delivered")
 		return wire.Response{OK: true}
 	case "snapshot":
 		s, ok := engine.Session(request.ID)
@@ -162,7 +202,64 @@ func describe(s *windrunner.Session) wire.SessionInfo {
 		Cols:     cols,
 		Rows:     rows,
 		Title:    s.Title(),
+		Peer:     s.Peer(),
 		Metadata: s.Metadata(),
+	}
+}
+
+// auditTextLimit bounds how much of a send lands in the audit trail; the
+// tail of anything longer is counted, not lost silently.
+const auditTextLimit = 1024
+
+func (cfg config) auditSend(request wire.Request, outcome string) {
+	if cfg.audit == nil {
+		return
+	}
+	from := request.From
+	if from == "" {
+		from = "unattributed"
+	}
+	text := request.Bytes
+	truncated := ""
+	if len(text) > auditTextLimit {
+		truncated = " +" + strconv.Itoa(len(text)-auditTextLimit) + " bytes"
+		text = text[:auditTextLimit]
+	}
+	cfg.audit.Printf("send from=%s to=%s %s (%d bytes): %q%s",
+		from, request.ID, outcome, len(request.Bytes), text, truncated)
+}
+
+// serveSubscribe streams engine events over one connection: an ack first,
+// then one Event frame per event until the client hangs up, the engine
+// closes, or the subscriber lags.
+func serveSubscribe(engine *windrunner.Engine, conn net.Conn, request wire.SubscribeRequest) {
+	sub := engine.Subscribe(request.Buffer)
+	defer sub.Close()
+	if err := wire.WriteJSON(conn, wire.FrameResponse, wire.Response{OK: true}); err != nil {
+		return
+	}
+	// The client speaks only by hanging up; notice when it does.
+	go func() {
+		for {
+			if _, _, err := wire.ReadFrame(conn); err != nil {
+				sub.Close()
+				return
+			}
+		}
+	}()
+	for event := range sub.Events() {
+		err := wire.WriteJSON(conn, wire.FrameEvent, wire.EventPayload{
+			Type:      string(event.Type),
+			SessionID: event.SessionID,
+			Command:   event.Command,
+			ExitCode:  event.ExitCode,
+		})
+		if err != nil {
+			return
+		}
+	}
+	if sub.Lagged() {
+		respondError(conn, "event subscriber lagged; subscribe again")
 	}
 }
 
