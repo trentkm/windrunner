@@ -376,3 +376,47 @@ func TestTitleSettingDoesNotDeadlock(t *testing.T) {
 		t.Fatalf("title = %q, want %q", got, "herd of one")
 	}
 }
+
+// A subscriber's replica paints in-flight bytes at whatever size it holds,
+// so a resize must push the re-wrapped truth through the stream itself —
+// ordered against output by the session lock — or replicas diverge until
+// the child happens to repaint every cell.
+func TestResizeBroadcastsARepaintToSubscribers(t *testing.T) {
+	engine := newTestEngine(t)
+	s := spawnShell(t, engine, `printf 'landmark\n'; while :; do sleep 0.1; done`)
+
+	waitFor(t, "landmark drawn", func() bool {
+		return strings.Contains(sessionText(s), "landmark")
+	})
+	_, sub := s.Attach(16)
+	if err := s.Resize(100, 30); err != nil {
+		t.Fatalf("Resize: %v", err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	var received strings.Builder
+	for {
+		select {
+		case chunk, open := <-sub.Output():
+			if !open {
+				t.Fatal("subscription closed before the repaint arrived")
+			}
+			received.Write(chunk)
+		case <-deadline:
+			t.Fatalf("no repaint after resize; received %q", received.String())
+		}
+		text := received.String()
+		if !strings.Contains(text, "\x1b[H\x1b[2J") {
+			continue
+		}
+		// The repaint carries the re-wrapped screen and parks the cursor.
+		after := text[strings.Index(text, "\x1b[H\x1b[2J"):]
+		if !strings.Contains(stripANSI(after), "landmark") {
+			continue
+		}
+		if !regexp.MustCompile(`\x1b\[\d+;\d+H`).MatchString(after) {
+			t.Fatalf("repaint did not restore the cursor: %q", after)
+		}
+		return
+	}
+}
