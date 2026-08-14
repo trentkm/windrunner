@@ -490,3 +490,71 @@ func TestCompleteBoundaryHoldsBackTornTails(t *testing.T) {
 		}
 	}
 }
+
+// A program that asks the terminal to report its title (CSI 21 t) must
+// not get the title typed into its stdin: real terminals refuse this
+// query precisely because the response is indistinguishable from typing.
+func TestTitleReportIsNotAnsweredIntoStdin(t *testing.T) {
+	engine := newTestEngine(t)
+	// Set a title, ask for it back, then echo stdin to stdout forever:
+	// anything the emulator answers becomes visible screen text.
+	s := spawnShell(t, engine,
+		`printf '\033]0;SECRET-TITLE\007\033[21t'; cat`)
+
+	time.Sleep(600 * time.Millisecond)
+	if text := sessionText(s); strings.Contains(text, "SECRET-TITLE") {
+		t.Fatalf("title report reached the child's stdin:\n%q", text)
+	}
+}
+
+// The snapshot carries cells but the terminal holds more state than
+// cells: a program that set scroll margins scrolls inside them, and a
+// replica seeded without the margins scrolls the whole screen — rows
+// drift apart permanently. Claude Code manages margins around its input
+// box, which is how header text ended up parked on the input line.
+func TestAttachSeedCarriesScrollMargins(t *testing.T) {
+	engine := newTestEngine(t)
+	// Pin rows 1-3 as a scroll region, park a footer on row 10, then
+	// scroll inside the region after the replica attaches.
+	s := spawnShell(t, engine,
+		`printf '\033[10;1HFOOTER-STAYS'; printf '\033[1;3r\033[1;1Hone\r\ntwo\r\nthree'; printf ready; sleep 0.4; printf '\r\nfour\r\nfive'; sleep 60`)
+
+	waitFor(t, "region painted", func() bool {
+		return strings.Contains(sessionText(s), "ready")
+	})
+	snapshot, sub := s.Attach(64)
+	defer sub.Close()
+	replica := vt.NewEmulator(snapshot.Cols, snapshot.Rows)
+	replica.Write(snapshot.ANSI)
+
+	deadline := time.After(3 * time.Second)
+	for {
+		local := stripANSI(replica.Render())
+		if strings.Contains(local, "five") {
+			truth := stripANSI(s.Snapshot().renderInto(t))
+			if local != truth {
+				t.Fatalf("replica diverged from the session:\nreplica:\n%s\n\nsession:\n%s",
+					local, truth)
+			}
+			return
+		}
+		select {
+		case message, open := <-sub.Output():
+			if !open {
+				t.Fatal("stream ended early")
+			}
+			replica.Write(message.Bytes)
+		case <-deadline:
+			t.Fatalf("scrolled rows never arrived:\n%s", local)
+		}
+	}
+}
+
+// renderInto replays a snapshot into a fresh emulator and renders it —
+// what any attaching client would see.
+func (snapshot Snapshot) renderInto(t *testing.T) string {
+	t.Helper()
+	emu := vt.NewEmulator(snapshot.Cols, snapshot.Rows)
+	emu.Write(snapshot.ANSI)
+	return emu.Render()
+}

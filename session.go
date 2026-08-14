@@ -78,6 +78,7 @@ type Session struct {
 	emu      *vt.Emulator
 	metadata map[string]string
 	title    string
+	state    termState
 	cols     int
 	rows     int
 	subs     map[*Subscription]struct{}
@@ -218,6 +219,7 @@ func (s *Session) readLoop() {
 		// child (post-exit PTY drain is an epilogue, not activity).
 		announce := !s.busy && !s.exited
 		s.busy = true
+		s.state.observe(chunk)
 		s.emu.Write(chunk)
 		for sub := range s.subs {
 			sub.deliver(Message{Bytes: chunk}, s)
@@ -503,6 +505,7 @@ func (s *Session) Resize(cols, rows int) error {
 	s.mu.Lock()
 	s.emu.Resize(cols, rows)
 	s.cols, s.rows = cols, rows
+	s.state.resize()
 	// A resize re-wraps this emulator, but a subscriber's replica has been
 	// painting the in-flight bytes at whatever size it reached first — the
 	// two grids diverge in the window between the client resizing its
@@ -528,10 +531,24 @@ func (s *Session) Resize(cols, rows int) error {
 // already in every replica's history, and replaying it would double it.
 func (s *Session) screenRepaintLocked() []byte {
 	var out strings.Builder
-	out.WriteString("\x1b[0m\x1b[H\x1b[2J")
+	// Painting rows through active margins would scroll the region; lift
+	// them, paint, then replay the tracked state and park the cursor.
+	out.WriteString("\x1b[0m\x1b[r\x1b[H\x1b[2J")
 	out.WriteString(strings.ReplaceAll(s.emu.Render(), "\n", "\r\n"))
+	out.WriteString(s.state.replay())
 	cursor := s.emu.CursorPosition()
-	fmt.Fprintf(&out, "\x1b[0m\x1b[%d;%dH", cursor.Y+1, cursor.X+1)
+	row, column := cursor.Y+1, cursor.X+1
+	if s.state.origin {
+		// With DECOM asserted, CUP addresses the scroll region: convert
+		// the absolute cursor into the region's coordinates.
+		if s.state.top > 0 {
+			row = max(1, row-(s.state.top-1))
+		}
+		if s.state.lrEnabled && s.state.left > 0 {
+			column = max(1, column-(s.state.left-1))
+		}
+	}
+	fmt.Fprintf(&out, "\x1b[0m\x1b[%d;%dH", row, column)
 	return []byte(out.String())
 }
 
@@ -549,12 +566,32 @@ func (s *Session) snapshotLocked() Snapshot {
 		out.WriteString(back.Line(index).Render())
 		out.WriteString("\r\n")
 	}
+	if s.state.alt {
+		// The cells below belong to the alternate screen; switch before
+		// painting them so leaving it later lands somewhere sane.
+		out.WriteString("\x1b[?1049h")
+	}
 	// Render joins rows with bare newlines; a replaying terminal needs the
 	// carriage returns too, or every row after a non-empty one drifts
 	// rightward by the previous row's width.
 	out.WriteString(strings.ReplaceAll(s.emu.Render(), "\n", "\r\n"))
+	// Cells are not the whole terminal: replay the state that decides how
+	// the next bytes become cells, margins last-but-one because DECSTBM
+	// homes the cursor and the final CUP parks it.
+	out.WriteString(s.state.replay())
 	cursor := s.emu.CursorPosition()
-	fmt.Fprintf(&out, "\x1b[0m\x1b[%d;%dH", cursor.Y+1, cursor.X+1)
+	row, column := cursor.Y+1, cursor.X+1
+	if s.state.origin {
+		// With DECOM asserted, CUP addresses the scroll region: convert
+		// the absolute cursor into the region's coordinates.
+		if s.state.top > 0 {
+			row = max(1, row-(s.state.top-1))
+		}
+		if s.state.lrEnabled && s.state.left > 0 {
+			column = max(1, column-(s.state.left-1))
+		}
+	}
+	fmt.Fprintf(&out, "\x1b[0m\x1b[%d;%dH", row, column)
 	return Snapshot{Cols: s.cols, Rows: s.rows, ANSI: []byte(out.String())}
 }
 
