@@ -424,3 +424,69 @@ func TestResizeBroadcastsARepaintToSubscribers(t *testing.T) {
 		return
 	}
 }
+
+// An attach snapshot taken while the PTY has delivered only half of an
+// escape sequence must not strand the tail: a fresh replica that missed
+// the head sees raw text and prints it at the cursor — a terminal title
+// like "Claude Code" materializing on an app's input line.
+func TestAttachMidEscapeSequenceDoesNotLeakTheTail(t *testing.T) {
+	engine := newTestEngine(t)
+	// The child emits half an OSC title, stalls, then the rest plus a
+	// landmark — two PTY reads with the seam inside the sequence.
+	s := spawnShell(t, engine,
+		`printf 'ground\033]0;Claude'; sleep 0.4; printf ' Code\007landmark\n'; while :; do sleep 0.1; done`)
+
+	waitFor(t, "first half arrived", func() bool {
+		return strings.Contains(sessionText(s), "ground")
+	})
+	snapshot, sub := s.Attach(64)
+	defer sub.Close()
+
+	replica := vt.NewEmulator(snapshot.Cols, snapshot.Rows)
+	replica.Write(snapshot.ANSI)
+	deadline := time.After(3 * time.Second)
+	for {
+		screen := stripANSI(replica.Render())
+		if strings.Contains(screen, "landmark") {
+			if strings.Contains(screen, "Code") {
+				t.Fatalf("title tail leaked into the replica's cells:\n%s", screen)
+			}
+			return
+		}
+		select {
+		case message, open := <-sub.Output():
+			if !open {
+				t.Fatal("stream ended before the landmark")
+			}
+			replica.Write(message.Bytes)
+		case <-deadline:
+			t.Fatalf("landmark never arrived; screen:\n%s", screen)
+		}
+	}
+}
+
+func TestCompleteBoundaryHoldsBackTornTails(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		chunk string
+		cut   int
+	}{
+		{"plain text passes whole", "hello", 5},
+		{"complete CSI passes whole", "a\x1b[31m", 6},
+		{"torn CSI held from ESC", "ab\x1b[3", 2},
+		{"bare trailing ESC held", "abc\x1b", 3},
+		{"complete OSC with BEL", "\x1b]0;t\x07x", 7},
+		{"torn OSC title held", "ok\x1b]0;Claude", 2},
+		{"OSC waiting on ST's backslash", "ok\x1b]0;t\x1b", 2},
+		{"complete OSC with ST", "\x1b]0;t\x1b\\z", 8},
+		{"charset designation is whole", "\x1b(Bx", 4},
+		{"torn charset designation held", "x\x1b(", 1},
+		{"torn UTF-8 rune held", "ab\xe2\x9c", 2},
+		{"complete UTF-8 passes", "ab\xe2\x9c\xb3", 5},
+	} {
+		if got := completeBoundary([]byte(test.chunk)); got != test.cut {
+			t.Errorf("%s: completeBoundary(%q) = %d, want %d",
+				test.name, test.chunk, got, test.cut)
+		}
+	}
+}
