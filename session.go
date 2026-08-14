@@ -213,7 +213,7 @@ func (s *Session) readLoop() {
 			s.busy = true
 			s.emu.Write(chunk)
 			for sub := range s.subs {
-				sub.deliver(chunk, s)
+				sub.deliver(Message{Bytes: chunk}, s)
 			}
 			s.mu.Unlock()
 			s.idleTimer.Reset(s.idleAfter)
@@ -393,9 +393,12 @@ func (s *Session) Resize(cols, rows int) error {
 	// lock as the output pump, so every subscriber sees old-size bytes,
 	// then this repaint, then new-size bytes, in exactly that order, and
 	// converges by construction.
-	repaint := s.screenRepaintLocked()
+	message := Message{
+		Bytes:  s.screenRepaintLocked(),
+		Resize: &Resize{Cols: cols, Rows: rows},
+	}
 	for sub := range s.subs {
-		sub.deliver(repaint, s)
+		sub.deliver(message, s)
 	}
 	s.mu.Unlock()
 	return nil
@@ -443,7 +446,7 @@ func (s *Session) Attach(buffer int) (Snapshot, *Subscription) {
 	if buffer <= 0 {
 		buffer = 64
 	}
-	sub := &Subscription{ch: make(chan []byte, buffer)}
+	sub := &Subscription{ch: make(chan Message, buffer)}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	snapshot := s.snapshotLocked()
@@ -501,17 +504,31 @@ func (s *Session) close() {
 }
 
 // Subscription is one attached reader of a session's output stream.
+// Message is one delivery on a subscription: terminal output bytes, and —
+// when the session's terminal moved under the subscriber — the new size,
+// carried with the repaint those bytes hold so a replica resizes and
+// repaints as one ordered step.
+type Message struct {
+	Bytes  []byte
+	Resize *Resize
+}
+
+// Resize is a terminal size change riding the stream.
+type Resize struct {
+	Cols, Rows int
+}
+
 type Subscription struct {
-	ch     chan []byte
+	ch     chan Message
 	mu     sync.Mutex
 	done   bool
 	lagged bool
 }
 
-// Output yields chunks of raw terminal output. The channel closes when the
-// session ends, the subscription is closed, or the reader falls too far
-// behind (see Lagged).
-func (sub *Subscription) Output() <-chan []byte { return sub.ch }
+// Output yields the stream's messages in terminal order. The channel
+// closes when the session ends, the subscription is closed, or the reader
+// falls too far behind (see Lagged).
+func (sub *Subscription) Output() <-chan Message { return sub.ch }
 
 // Lagged reports whether the subscription was dropped for reading too
 // slowly. The recovery is to attach again: a fresh snapshot is always
@@ -535,14 +552,14 @@ func (sub *Subscription) Close() {
 
 // deliver hands a chunk to the subscriber without ever blocking the read
 // loop: a full buffer marks the subscriber lagged and drops it.
-func (sub *Subscription) deliver(chunk []byte, s *Session) {
+func (sub *Subscription) deliver(message Message, s *Session) {
 	sub.mu.Lock()
 	if sub.done {
 		sub.mu.Unlock()
 		return
 	}
 	select {
-	case sub.ch <- chunk:
+	case sub.ch <- message:
 		sub.mu.Unlock()
 	default:
 		sub.lagged = true

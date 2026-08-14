@@ -259,6 +259,10 @@ type Attachment struct {
 
 	writeMu sync.Mutex
 	once    sync.Once
+
+	resizeMu      sync.Mutex
+	onResize      func(cols, rows int)
+	pendingResize *wire.ResizePayload
 }
 
 // Attach opens a dedicated connection to one session and returns after
@@ -307,6 +311,34 @@ func (a *Attachment) Snapshot() wire.SnapshotPayload { return a.snapshot }
 // the attachment ends.
 func (a *Attachment) Output() <-chan []byte { return a.output }
 
+// OnResize registers the handler for session resizes that arrive over the
+// stream — the session's terminal moved, whoever moved it. The handler
+// runs on the read loop, ahead of the repaint bytes the resize travels
+// with; a resize that arrived before registration is delivered
+// immediately.
+func (a *Attachment) OnResize(handler func(cols, rows int)) {
+	a.resizeMu.Lock()
+	pending := a.pendingResize
+	a.pendingResize = nil
+	a.onResize = handler
+	a.resizeMu.Unlock()
+	if pending != nil && handler != nil {
+		handler(pending.Cols, pending.Rows)
+	}
+}
+
+func (a *Attachment) handleResize(payload wire.ResizePayload) {
+	a.resizeMu.Lock()
+	handler := a.onResize
+	if handler == nil {
+		a.pendingResize = &payload
+	}
+	a.resizeMu.Unlock()
+	if handler != nil {
+		handler(payload.Cols, payload.Rows)
+	}
+}
+
 // Exited yields the process's exit code if it ends while attached.
 func (a *Attachment) Exited() <-chan int { return a.exited }
 
@@ -339,6 +371,11 @@ func (a *Attachment) readLoop() {
 		switch frameType {
 		case wire.FrameOutput:
 			a.output <- payload
+		case wire.FrameResize:
+			var moved wire.ResizePayload
+			if err := json.Unmarshal(payload, &moved); err == nil {
+				a.handleResize(moved)
+			}
 		case wire.FrameExited:
 			var exited wire.ExitedPayload
 			if err := json.Unmarshal(payload, &exited); err == nil {
