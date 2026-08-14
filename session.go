@@ -199,29 +199,54 @@ func cloneMetadata(metadata map[string]string) map[string]string {
 // readLoop is the one writer of terminal state: PTY output feeds the
 // emulator and fans out to subscribers. It ends when the child exits (the
 // master read fails once the slave side closes).
+//
+// Every write lands on a whole-sequence boundary: a PTY read can end in
+// the middle of an escape sequence or a multibyte rune, and anything that
+// samples the emulator between writes — an attach snapshot, a resize
+// repaint — would strand the tail, which a fresh replica then prints as
+// text at the cursor. A terminal title split across the seam is how
+// "Claude Code" once materialized on an agent's input line. The
+// incomplete tail is held back and prepended to the next read; a child
+// that dies mid-sequence gets its remnant flushed at the end, because a
+// lost byte is worse than a torn one with nobody left to finish it.
 func (s *Session) readLoop() {
 	buf := make([]byte, 32*1024)
+	var pending []byte
+	write := func(chunk []byte) {
+		s.mu.Lock()
+		// Output means busy; announce the transition only for a live
+		// child (post-exit PTY drain is an epilogue, not activity).
+		announce := !s.busy && !s.exited
+		s.busy = true
+		s.emu.Write(chunk)
+		for sub := range s.subs {
+			sub.deliver(Message{Bytes: chunk}, s)
+		}
+		s.mu.Unlock()
+		s.idleTimer.Reset(s.idleAfter)
+		if announce {
+			s.publish(Event{Type: EventBusy, SessionID: s.id})
+		}
+	}
 	for {
 		n, err := s.ptyFile.Read(buf)
 		if n > 0 {
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-			s.mu.Lock()
-			// Output means busy; announce the transition only for a live
-			// child (post-exit PTY drain is an epilogue, not activity).
-			announce := !s.busy && !s.exited
-			s.busy = true
-			s.emu.Write(chunk)
-			for sub := range s.subs {
-				sub.deliver(Message{Bytes: chunk}, s)
+			chunk := append(pending, buf[:n]...)
+			cut := completeBoundary(chunk)
+			if cut == 0 && len(chunk) > maxHoldback {
+				// A pathological unterminated sequence must not dam the
+				// stream forever; a torn flush is the lesser harm.
+				cut = len(chunk)
 			}
-			s.mu.Unlock()
-			s.idleTimer.Reset(s.idleAfter)
-			if announce {
-				s.publish(Event{Type: EventBusy, SessionID: s.id})
+			if cut > 0 {
+				write(chunk[:cut])
 			}
+			pending = append([]byte(nil), chunk[cut:]...)
 		}
 		if err != nil {
+			if len(pending) > 0 {
+				write(pending)
+			}
 			s.mu.Lock()
 			for sub := range s.subs {
 				sub.finish()
@@ -231,6 +256,100 @@ func (s *Session) readLoop() {
 			return
 		}
 	}
+}
+
+// maxHoldback bounds the tail held for an unterminated sequence; a real
+// title or query is bytes, not kilobytes.
+const maxHoldback = 64 * 1024
+
+// completeBoundary returns the length of chunk's longest prefix that ends
+// on a whole-sequence, whole-rune boundary: everything after it is the
+// start of an escape sequence or multibyte rune still waiting for its
+// remainder.
+func completeBoundary(chunk []byte) int {
+	const (
+		ground = iota
+		escape       // ESC seen
+		csi          // ESC [ … until a final byte 0x40..0x7E
+		str          // OSC/DCS/APC/PM/SOS … until BEL or ST
+		strEscape    // ESC inside a string: ST's first half
+	)
+	state := ground
+	start := 0
+	for index := 0; index < len(chunk); index++ {
+		b := chunk[index]
+		switch state {
+		case ground:
+			if b == 0x1b {
+				state, start = escape, index
+			}
+		case escape:
+			switch {
+			case b == '[':
+				state = csi
+			case b == ']' || b == 'P' || b == '^' || b == '_' || b == 'X':
+				state = str
+			case b >= 0x20 && b <= 0x2f:
+				// Intermediates continue the sequence (ESC ( B and kin).
+			default:
+				// Any other byte is the final; the sequence is whole.
+				state = ground
+			}
+		case csi:
+			if b >= 0x40 && b <= 0x7e {
+				state = ground
+			}
+		case str:
+			switch b {
+			case 0x07:
+				state = ground
+			case 0x1b:
+				state = strEscape
+			}
+		case strEscape:
+			// ESC \ is ST; anything else stays inside the string (and an
+			// ESC starting another sequence inside an OSC is malformed
+			// enough not to guess about).
+			if b == '\\' {
+				state = ground
+			} else {
+				state = str
+			}
+		}
+	}
+	if state != ground {
+		return start
+	}
+	return len(chunk) - incompleteRuneTail(chunk)
+}
+
+// incompleteRuneTail counts trailing bytes that begin a UTF-8 rune whose
+// remainder has not arrived.
+func incompleteRuneTail(chunk []byte) int {
+	for back := 1; back <= 3 && back <= len(chunk); back++ {
+		b := chunk[len(chunk)-back]
+		if b&0xc0 == 0x80 {
+			continue // continuation byte; keep looking for the start
+		}
+		var need int
+		switch {
+		case b&0x80 == 0:
+			need = 1
+		case b&0xe0 == 0xc0:
+			need = 2
+		case b&0xf0 == 0xe0:
+			need = 3
+		case b&0xf8 == 0xf0:
+			need = 4
+		default:
+			return 0 // invalid start; nothing worth holding
+		}
+		if need > back {
+			return back
+		}
+		return 0
+	}
+	return 0
 }
 
 // respondLoop carries the emulator's own voice back to the child: answers
