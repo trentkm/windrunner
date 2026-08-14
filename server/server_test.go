@@ -354,3 +354,69 @@ func TestAuditTrailRecordsSends(t *testing.T) {
 		}
 	}
 }
+
+// A session's terminal can be moved by anyone — another dashboard, a
+// full-screen attach — so every attachment hears about it: the new size
+// arrives over the stream, ahead of the repaint it travels with, and a
+// handler registered late still gets the last size.
+func TestResizeNoticeReachesAttachedClients(t *testing.T) {
+	c := startStack(t)
+	info, err := c.Spawn(wire.Request{
+		Command: "/bin/sh",
+		Args:    []string{"-c", `printf landmark; while :; do sleep 0.1; done`},
+		Cols:    80,
+		Rows:    24,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	a, err := c.Attach(info.ID, 64)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	defer a.Close()
+
+	sizes := make(chan [2]int, 4)
+	a.OnResize(func(cols, rows int) { sizes <- [2]int{cols, rows} })
+
+	if err := c.Resize(info.ID, 132, 43); err != nil {
+		t.Fatalf("Resize: %v", err)
+	}
+	select {
+	case size := <-sizes:
+		if size != [2]int{132, 43} {
+			t.Fatalf("resize notice = %v, want 132x43", size)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no resize notice reached the attachment")
+	}
+	// The repaint rides right behind the notice.
+	drainUntil(t, a, "landmark")
+
+	// Late registration replays the size the stream already carried.
+	late, err := c.Attach(info.ID, 64)
+	if err != nil {
+		t.Fatalf("second Attach: %v", err)
+	}
+	defer late.Close()
+	if err := c.Resize(info.ID, 100, 30); err != nil {
+		t.Fatalf("second Resize: %v", err)
+	}
+	lateSizes := make(chan [2]int, 4)
+	deadline := time.After(2 * time.Second)
+	for {
+		late.OnResize(func(cols, rows int) { lateSizes <- [2]int{cols, rows} })
+		select {
+		case size := <-lateSizes:
+			if size != [2]int{100, 30} {
+				t.Fatalf("late resize notice = %v, want 100x30", size)
+			}
+			return
+		case <-deadline:
+			t.Fatal("late handler never saw the pending resize")
+		default:
+			late.OnResize(nil)
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}

@@ -71,7 +71,7 @@ func TestOutputReachesEmulatorAndSubscribers(t *testing.T) {
 			if !ok {
 				t.Fatalf("stream closed early; got %q", streamed.String())
 			}
-			streamed.Write(chunk)
+			streamed.Write(chunk.Bytes)
 		case <-deadline:
 			t.Fatalf("streamed output missing greeting: %q", streamed.String())
 		}
@@ -401,7 +401,11 @@ func TestResizeBroadcastsARepaintToSubscribers(t *testing.T) {
 			if !open {
 				t.Fatal("subscription closed before the repaint arrived")
 			}
-			received.Write(chunk)
+			if chunk.Resize != nil &&
+				(chunk.Resize.Cols != 100 || chunk.Resize.Rows != 30) {
+				t.Fatalf("resize notice = %+v", chunk.Resize)
+			}
+			received.Write(chunk.Bytes)
 		case <-deadline:
 			t.Fatalf("no repaint after resize; received %q", received.String())
 		}

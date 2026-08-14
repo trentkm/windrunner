@@ -309,8 +309,19 @@ func serveAttach(engine *windrunner.Engine, conn net.Conn, request wire.AttachRe
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for chunk := range sub.Output() {
-			if err := writeRaw(wire.FrameOutput, chunk); err != nil {
+		for message := range sub.Output() {
+			if message.Resize != nil {
+				// The size travels ahead of the repaint it arrived with,
+				// so a client resizes its replica and then paints.
+				if err := write(wire.FrameResize, wire.ResizePayload{
+					Cols: message.Resize.Cols,
+					Rows: message.Resize.Rows,
+				}); err != nil {
+					conn.Close()
+					return
+				}
+			}
+			if err := writeRaw(wire.FrameOutput, message.Bytes); err != nil {
 				conn.Close()
 				return
 			}
