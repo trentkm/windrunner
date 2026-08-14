@@ -384,8 +384,33 @@ func (s *Session) Resize(cols, rows int) error {
 	s.mu.Lock()
 	s.emu.Resize(cols, rows)
 	s.cols, s.rows = cols, rows
+	// A resize re-wraps this emulator, but a subscriber's replica has been
+	// painting the in-flight bytes at whatever size it reached first — the
+	// two grids diverge in the window between the client resizing its
+	// replica and this resize landing, and the child's SIGWINCH repaint is
+	// allowed to be partial, so the divergence can be permanent. Broadcast
+	// the re-wrapped screen into the stream itself: delivery holds the same
+	// lock as the output pump, so every subscriber sees old-size bytes,
+	// then this repaint, then new-size bytes, in exactly that order, and
+	// converges by construction.
+	repaint := s.screenRepaintLocked()
+	for sub := range s.subs {
+		sub.deliver(repaint, s)
+	}
 	s.mu.Unlock()
 	return nil
+}
+
+// screenRepaintLocked serializes the live screen as a clear-and-repaint:
+// home, clear, every row, cursor restored. Screen only — scrollback is
+// already in every replica's history, and replaying it would double it.
+func (s *Session) screenRepaintLocked() []byte {
+	var out strings.Builder
+	out.WriteString("\x1b[0m\x1b[H\x1b[2J")
+	out.WriteString(strings.ReplaceAll(s.emu.Render(), "\n", "\r\n"))
+	cursor := s.emu.CursorPosition()
+	fmt.Fprintf(&out, "\x1b[0m\x1b[%d;%dH", cursor.Y+1, cursor.X+1)
+	return []byte(out.String())
 }
 
 // Snapshot serializes the terminal's exact current state.
