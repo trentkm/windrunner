@@ -391,6 +391,7 @@ func (s *Session) respondLoop() {
 		}
 	}()
 	for chunk := range responses {
+		logStdin(s.id, "emulator", chunk)
 		s.writeMu.Lock()
 		_, err := s.ptyFile.Write(chunk)
 		s.writeMu.Unlock()
@@ -485,9 +486,26 @@ func (s *Session) ExitCode() int {
 
 // Write delivers input bytes to the child, exactly as typed.
 func (s *Session) Write(p []byte) (int, error) {
+	logStdin(s.id, "client", p)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	return s.ptyFile.Write(p)
+}
+
+// logStdin is a diagnostic tap on everything written to a session's
+// stdin, tagged by source; enabled by WINDRUNNER_STDIN_LOG naming a file.
+func logStdin(id, source string, p []byte) {
+	path := os.Getenv("WINDRUNNER_STDIN_LOG")
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s %s %s %q\n",
+		time.Now().Format("15:04:05.000"), id[:8], source, p)
 }
 
 // Resize moves the PTY and the emulator together; the child learns via
