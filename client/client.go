@@ -51,6 +51,10 @@ func EnsureDaemon(socketPath string, daemonArgv []string, timeout time.Duration)
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
+	// The daemon must outlive the terminal that happened to start it: a
+	// new session detaches it from the controlling tty, so the hangup
+	// that ends the launching shell never reaches the agents' PTYs.
+	cmd.SysProcAttr = daemonSysProcAttr()
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("windrunner: start daemon: %w", err)
 	}
