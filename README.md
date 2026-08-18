@@ -30,6 +30,13 @@ extracted, embeddable, and unopinionated about what you build on top.
   supply — a unix socket by default, anything ordered and full-duplex
   otherwise — so a daemon on the far side of an SSH bridge is the same
   daemon to every call.
+- **Slow clients repaint instead of dying.** A client that cannot keep up
+  with a burst is normally dropped, because an unbounded backlog is worse.
+  One that attaches with `Resync` is handed the terminal's exact state at
+  the moment it fell behind and keeps streaming from there — the bytes it
+  missed are gone, but its replica is correct. That is the right trade for
+  anything that watches (a browser terminal, a wall of live panes) and the
+  wrong one for anything that must see every byte, so it is a choice.
 - **Sessions carry opaque metadata.** Tag sessions with whatever your
   product means by them — task, branch, agent, owner. Windrunner stores and
   returns the bag; it never interprets it.

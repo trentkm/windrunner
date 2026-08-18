@@ -274,7 +274,10 @@ func serveAttach(engine *windrunner.Engine, conn net.Conn, request wire.AttachRe
 		respondError(conn, "no such session: "+request.ID)
 		return
 	}
-	snapshot, sub := s.Attach(request.Buffer)
+	snapshot, sub := s.AttachWith(windrunner.AttachOptions{
+		Buffer: request.Buffer,
+		Resync: request.Resync,
+	})
 	defer sub.Close()
 
 	// One writer at a time: the output pump and the exit notice race for
@@ -311,6 +314,21 @@ func serveAttach(engine *windrunner.Engine, conn net.Conn, request wire.AttachRe
 	go func() {
 		defer close(done)
 		for message := range sub.Output() {
+			if message.Resync != nil {
+				// The client fell behind; its backlog is gone and this
+				// state stands in for it. Same frame as the attach-time
+				// snapshot: a resyncing client already knows to replace
+				// its replica when one arrives.
+				if err := write(wire.FrameSnapshot, wire.SnapshotPayload{
+					Cols: message.Resync.Cols,
+					Rows: message.Resync.Rows,
+					ANSI: message.Resync.ANSI,
+				}); err != nil {
+					conn.Close()
+					return
+				}
+				continue
+			}
 			if message.Resize != nil {
 				// The size travels ahead of the repaint it arrived with,
 				// so a client resizes its replica and then paints.

@@ -6,7 +6,9 @@
 //   - An attach connection is dedicated to one session: the client sends
 //     Attach, the server answers with a Snapshot, and from then on the
 //     server streams Output frames while the client sends Input and
-//     Resize. Closing the connection is detaching.
+//     Resize. Closing the connection is detaching. A client that asked to
+//     resync may also receive a later Snapshot frame, which replaces its
+//     replica wholesale (see AttachRequest.Resync).
 //   - A subscribe connection is a feed of engine events: the client sends
 //     Subscribe, the server acks with a Response, and from then on the
 //     server streams Event frames — session lifecycle and idle/busy
@@ -111,6 +113,12 @@ type AttachRequest struct {
 	// Buffer is the subscriber's chunk buffer; falling behind it means
 	// being dropped and re-attaching.
 	Buffer int `json:"buffer,omitempty"`
+	// Resync asks to stay attached when the client falls behind: instead
+	// of being dropped, it receives another Snapshot frame carrying the
+	// terminal's exact state at that moment, and the stream continues
+	// from there. A client that asks for it must treat a mid-stream
+	// Snapshot as a replacement for its replica, not as more output.
+	Resync bool `json:"resync,omitempty"`
 }
 
 type SnapshotPayload struct {
