@@ -637,12 +637,18 @@ const resyncInterval = 100 * time.Millisecond
 // would multiply the cost this interval exists to bound.
 func (s *Session) flushResyncsLocked(force bool) {
 	var shared *Snapshot
+	// One serialization, handed out as a value per subscriber so no two
+	// share a header. They do share the ANSI bytes underneath, which are
+	// written once here and never again — an in-process consumer that
+	// rewrites them in place would corrupt every other subscriber's
+	// state, which is what the doc on Message.Resync warns about.
 	snapshot := func() *Snapshot {
 		if shared == nil {
 			state := s.snapshotLocked()
 			shared = &state
 		}
-		return shared
+		state := *shared
+		return &state
 	}
 	owed := false
 	for sub := range s.subs {
@@ -655,7 +661,16 @@ func (s *Session) flushResyncsLocked(force bool) {
 			sub.ch <- Message{Resync: snapshot()}
 			sub.missed = false
 		case force:
-			<-sub.ch
+			// Never a bare receive. The buffer was full a moment ago, but
+			// the consumer is draining concurrently and may have emptied
+			// it — and a receive that blocks here blocks holding the
+			// session lock, which the only producer needs and the only
+			// closers need, so nothing could ever free it. One wedged
+			// session would then hang every list in the daemon.
+			select {
+			case <-sub.ch:
+			default:
+			}
 			sub.ch <- Message{Resync: snapshot()}
 			sub.missed = false
 		default:
@@ -847,6 +862,10 @@ type Message struct {
 	// dropped in favor of this exact state (see AttachOptions.Resync).
 	// Bytes is nil and later messages continue from here, so a replica
 	// applies it by replacing itself wholesale rather than appending.
+	//
+	// Its ANSI is read-only: one serialization is shared by every
+	// subscriber owed state at that moment, so rewriting it in place
+	// corrupts the others. Copy before modifying.
 	Resync *Snapshot
 }
 

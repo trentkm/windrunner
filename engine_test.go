@@ -217,6 +217,12 @@ func TestResyncSubscriberSurvivesTheFloodItMissed(t *testing.T) {
 	waitFor(t, "flood completion", func() bool {
 		return strings.Contains(sessionText(s), "flood 500")
 	})
+	// Falling behind is not lagging: the contract is that a resyncing
+	// subscriber is never dropped for it, and Lagged is how a caller
+	// would find out otherwise.
+	if sub.Lagged() {
+		t.Fatal("a resyncing subscriber was marked lagged")
+	}
 
 	// Draining eventually reaches the resync: state, not more deltas.
 	var resync *Snapshot
@@ -391,10 +397,20 @@ func TestResyncCostIsPacedNotPerRead(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	// One per interval is the design; allow generous slack for scheduling
-	// while still failing the per-read behavior, which would be an order
-	// of magnitude more.
-	if limit := 3 * int(window/resyncInterval); resyncs > limit {
+	// This test is about the ceiling: per-read delivery is an order of
+	// magnitude above it. The floor is only there so that a feature
+	// delivering nothing at all cannot satisfy a ceiling perfectly — how
+	// many arrive depends on how the reader and the flood interleave,
+	// which varies by an order of magnitude under the race detector, so
+	// asserting a rate here would measure the machine. That resyncs
+	// actually arrive, and carry the right state, is what the tests above
+	// are for.
+	intervals := int(window / resyncInterval)
+	if resyncs == 0 {
+		t.Fatalf("no resyncs in %v — a subscriber this far behind was "+
+			"handed no state at all", window)
+	}
+	if limit := 3 * intervals; resyncs > limit {
 		t.Fatalf("%d resyncs in %v — paced delivery would be at most ~%d",
 			resyncs, window, limit)
 	}

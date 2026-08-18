@@ -127,6 +127,14 @@ func TestMalformedSnapshotEndsTheStream(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("stream neither closed nor delivered anything")
 	}
+
+	// And the connection goes with it. Ending the stream while leaving
+	// the socket open would leave the daemon streaming to nobody — for a
+	// resyncing attachment, serializing fresh state forever on behalf of
+	// a client that stopped listening.
+	if err := wire.WriteFrame(daemon, wire.FrameOutput, []byte("anyone there?")); err == nil {
+		t.Fatal("the connection outlived the stream")
+	}
 }
 
 func next(t *testing.T, a *Attachment) Message {

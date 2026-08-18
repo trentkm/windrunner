@@ -414,6 +414,12 @@ func (a *Attachment) Close() {
 }
 
 func (a *Attachment) readLoop() {
+	// Close the connection, not just the stream. Every other exit here
+	// follows a read error, where the connection is already gone — but a
+	// frame this loop refuses to understand ends a perfectly healthy one,
+	// and abandoning it would leave the daemon streaming to nobody,
+	// re-serializing state forever for a client that stopped listening.
+	defer a.Close()
 	defer close(a.output)
 	for {
 		frameType, payload, err := wire.ReadFrame(a.conn)
