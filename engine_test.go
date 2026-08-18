@@ -185,6 +185,114 @@ func TestLaggedSubscriberIsDroppedNotBlocking(t *testing.T) {
 	})
 }
 
+// nextMessage reads one message from a subscription, or fails.
+func nextMessage(t *testing.T, sub *Subscription) Message {
+	t.Helper()
+	select {
+	case message, ok := <-sub.Output():
+		if !ok {
+			t.Fatal("subscription closed early")
+		}
+		return message
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for a message")
+	}
+	panic("unreachable")
+}
+
+// TestResyncSubscriberSurvivesTheFloodItMissed: a subscriber that asked to
+// resync is never dropped for reading slowly. The bytes it could not keep
+// up with are gone, but what replaces them is the terminal's exact state
+// at that moment — so a viewer repaints instead of reconnecting, and the
+// stream carries on.
+func TestResyncSubscriberSurvivesTheFloodItMissed(t *testing.T) {
+	engine := newTestEngine(t)
+	s := spawnShell(t, engine,
+		`i=0; while [ $i -le 500 ]; do printf 'flood %d\n' $i; i=$((i+1)); done
+		 while read line; do printf 'got:%s\n' "$line"; done`)
+
+	// One message deep and unread while the flood runs: the subscription
+	// cannot help but fall behind.
+	_, sub := s.AttachWith(AttachOptions{Buffer: 1, Resync: true})
+	waitFor(t, "flood completion", func() bool {
+		return strings.Contains(sessionText(s), "flood 500")
+	})
+	if sub.Lagged() {
+		t.Fatal("a resyncing subscriber must never be marked lagged")
+	}
+
+	// Draining eventually reaches the resync: state, not more deltas.
+	var resync *Snapshot
+	for deadline := time.Now().Add(5 * time.Second); resync == nil; {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for a resync")
+		}
+		message := nextMessage(t, sub)
+		if message.Resync == nil {
+			continue
+		}
+		resync = message.Resync
+		if message.Bytes != nil {
+			t.Fatalf("a resync carries state alone, not %q", message.Bytes)
+		}
+	}
+	if text := stripANSI(string(resync.ANSI)); !strings.Contains(text, "flood 500") {
+		t.Fatalf("resync missed the state it stands in for:\n%s", text)
+	}
+
+	// Still attached: the session's later output reaches it as usual.
+	if _, err := s.Write([]byte("resumed\r")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	var seen strings.Builder
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		if time.Now().After(deadline) {
+			t.Fatalf("stream did not resume after the resync; saw %q", seen.String())
+		}
+		message := nextMessage(t, sub)
+		seen.Write(message.Bytes)
+		if strings.Contains(stripANSI(seen.String()), "got:resumed") {
+			break
+		}
+	}
+}
+
+// TestResyncArrivesOnceTheTerminalGoesQuiet: the burst that dropped a
+// subscriber's bytes may be the last thing the session ever writes.
+// Nothing is left to carry the state it is owed, so going idle delivers
+// it — a viewer must not sit on stale state until the next keystroke.
+func TestResyncArrivesOnceTheTerminalGoesQuiet(t *testing.T) {
+	engine := newTestEngine(t)
+	s, err := engine.Spawn(SpawnSpec{
+		Command: "/bin/sh",
+		Args: []string{"-c",
+			`i=0; while [ $i -le 500 ]; do printf 'flood %d\n' $i; i=$((i+1)); done; sleep 60`},
+		Cols: 80, Rows: 24,
+		IdleAfter: 150 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	_, sub := s.AttachWith(AttachOptions{Buffer: 1, Resync: true})
+	waitFor(t, "flood completion", func() bool {
+		return strings.Contains(sessionText(s), "flood 500")
+	})
+	// Read exactly one message to free the slot the resync needs, then
+	// stop: from here only the idle flush can deliver it.
+	nextMessage(t, sub)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the idle flush to deliver a resync")
+		}
+		if message := nextMessage(t, sub); message.Resync != nil {
+			return
+		}
+	}
+}
+
 func nextEvent(t *testing.T, sub *EventSubscription) Event {
 	t.Helper()
 	select {

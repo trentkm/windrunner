@@ -109,6 +109,10 @@ type Session struct {
 	busy      bool
 	idleAfter time.Duration
 	idleTimer *time.Timer
+
+	// resyncTimer re-offers state to subscribers owed a resync; see
+	// armResyncRetryLocked. Guarded by mu, nil when nothing is owed.
+	resyncTimer *time.Timer
 }
 
 func startSession(id string, spec SpawnSpec, publish func(Event)) (*Session, error) {
@@ -283,6 +287,9 @@ func (s *Session) readLoop() {
 				write(pending)
 			}
 			s.mu.Lock()
+			// Last call: a subscriber owed a resync gets the final state
+			// before the stream closes under it.
+			s.flushResyncsLocked()
 			for sub := range s.subs {
 				sub.finish()
 			}
@@ -459,6 +466,10 @@ func (s *Session) goIdle() {
 		return
 	}
 	s.busy = false
+	// Nothing more is coming to carry a pending resync: a subscriber that
+	// fell behind during the burst that just ended would otherwise sit on
+	// stale state until the terminal happened to move again.
+	s.flushResyncsLocked()
 	s.mu.Unlock()
 	s.publish(Event{Type: EventIdle, SessionID: s.id})
 }
@@ -603,6 +614,48 @@ func (s *Session) screenRepaintLocked() []byte {
 	return []byte(out.String())
 }
 
+// resyncRetry paces the re-offer of state to a subscriber that is owed
+// some but had no room for it. Room appears when the subscriber reads,
+// and a channel cannot announce that, so the session looks again shortly
+// — briefly, and only while something is actually owed.
+const resyncRetry = 50 * time.Millisecond
+
+// flushResyncsLocked hands exact state to every subscriber that missed
+// bytes and has room for it, and keeps trying for the ones that had none.
+// Called with the session lock held, wherever a resync might otherwise
+// strand: the terminal going quiet, the stream ending, and the retry
+// itself.
+func (s *Session) flushResyncsLocked() {
+	owed := false
+	for sub := range s.subs {
+		sub.mu.Lock()
+		sub.flushResyncLocked(s)
+		owed = owed || sub.missed
+		sub.mu.Unlock()
+	}
+	if owed {
+		s.armResyncRetryLocked()
+	}
+}
+
+// armResyncRetryLocked schedules one look at the subscribers still owed
+// state. One timer serves the whole session, and it stops arming itself
+// as soon as nothing is owed.
+func (s *Session) armResyncRetryLocked() {
+	if s.closed || s.resyncTimer != nil {
+		return
+	}
+	s.resyncTimer = time.AfterFunc(resyncRetry, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.resyncTimer = nil
+		if s.closed {
+			return
+		}
+		s.flushResyncsLocked()
+	})
+}
+
 // Snapshot serializes the terminal's exact current state.
 func (s *Session) Snapshot() Snapshot {
 	s.mu.Lock()
@@ -646,14 +699,39 @@ func (s *Session) snapshotLocked() Snapshot {
 	return Snapshot{Cols: s.cols, Rows: s.rows, ANSI: []byte(out.String())}
 }
 
+// AttachOptions configures a subscription. The zero value is the historical
+// behavior: the default buffer, dropped on lag.
+type AttachOptions struct {
+	// Buffer is the subscription's message buffer; 0 means 64.
+	Buffer int
+	// Resync trades byte-exact replay for staying attached. A subscriber
+	// that fills its buffer is normally dropped (see Lagged); one that
+	// asked to resync instead has its backlog replaced by a Message
+	// carrying the terminal's exact state at the moment it fell behind,
+	// and keeps streaming from there.
+	//
+	// This is the right trade for a viewer and the wrong one for a
+	// recorder: a replica that repaints ends up correct, while a transcript
+	// with a hole in it does not. Watching clients — a browser terminal,
+	// a wall of live panes — should ask for it; anything that must see
+	// every byte should not.
+	Resync bool
+}
+
 // Attach returns the session's state right now and a subscription that
 // carries every output byte after it — atomically, so nothing falls in the
-// gap between snapshot and stream.
+// gap between snapshot and stream. Shorthand for AttachWith of a buffer.
 func (s *Session) Attach(buffer int) (Snapshot, *Subscription) {
+	return s.AttachWith(AttachOptions{Buffer: buffer})
+}
+
+// AttachWith is Attach with a policy: see AttachOptions.
+func (s *Session) AttachWith(options AttachOptions) (Snapshot, *Subscription) {
+	buffer := options.Buffer
 	if buffer <= 0 {
 		buffer = 64
 	}
-	sub := &Subscription{ch: make(chan Message, buffer)}
+	sub := &Subscription{ch: make(chan Message, buffer), resync: options.Resync}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	snapshot := s.snapshotLocked()
@@ -693,9 +771,16 @@ func (s *Session) close() {
 	s.closed = true
 	subs := s.subs
 	s.subs = make(map[*Subscription]struct{})
+	// Unlike idleTimer, this one is created and cleared under the lock;
+	// take it with everything else rather than reading it outside.
+	resyncTimer := s.resyncTimer
+	s.resyncTimer = nil
 	s.mu.Unlock()
 
 	s.idleTimer.Stop()
+	if resyncTimer != nil {
+		resyncTimer.Stop()
+	}
 	for sub := range subs {
 		sub.finish()
 	}
@@ -718,6 +803,12 @@ func (s *Session) close() {
 type Message struct {
 	Bytes  []byte
 	Resize *Resize
+	// Resync, when set, supersedes everything the subscriber had not read
+	// yet: the reader fell a whole buffer behind, so the backlog was
+	// dropped in favor of this exact state (see AttachOptions.Resync).
+	// Bytes is nil and later messages continue from here, so a replica
+	// applies it by replacing itself wholesale rather than appending.
+	Resync *Snapshot
 }
 
 // Resize is a terminal size change riding the stream.
@@ -727,9 +818,13 @@ type Resize struct {
 
 type Subscription struct {
 	ch     chan Message
+	resync bool
 	mu     sync.Mutex
 	done   bool
 	lagged bool
+	// missed marks a resyncing subscriber that has had output dropped and
+	// is owed exact state before any further bytes.
+	missed bool
 }
 
 // Output yields the stream's messages in terminal order. The channel
@@ -739,7 +834,8 @@ func (sub *Subscription) Output() <-chan Message { return sub.ch }
 
 // Lagged reports whether the subscription was dropped for reading too
 // slowly. The recovery is to attach again: a fresh snapshot is always
-// cheaper than an unbounded backlog.
+// cheaper than an unbounded backlog. A subscription that asked to resync
+// is never dropped for lag, so this is always false for one.
 func (sub *Subscription) Lagged() bool {
 	sub.mu.Lock()
 	defer sub.mu.Unlock()
@@ -758,23 +854,73 @@ func (sub *Subscription) Close() {
 }
 
 // deliver hands a chunk to the subscriber without ever blocking the read
-// loop: a full buffer marks the subscriber lagged and drops it.
+// loop — one slow reader must never stall the session or its other
+// subscribers. A full buffer marks the subscriber lagged and drops it,
+// unless it asked to resync, in which case its backlog is collapsed into
+// the terminal's exact state and it keeps streaming.
+//
+// Called with the session lock held, which is what makes the resync path
+// correct: the state serialized here already includes this message and
+// everything discarded behind it, and every later message is delivered
+// after it. The subscriber therefore sees state-then-deltas with no gap
+// and no double-application.
 func (sub *Subscription) deliver(message Message, s *Session) {
 	sub.mu.Lock()
+	defer sub.mu.Unlock()
 	if sub.done {
-		sub.mu.Unlock()
+		return
+	}
+	if sub.missed {
+		// Bytes have already been dropped for this subscriber, so what it
+		// needs now is state rather than more deltas: give it the
+		// snapshot as soon as there is room, and drop this message too
+		// until then.
+		sub.flushResyncLocked(s)
+		if sub.missed {
+			s.armResyncRetryLocked()
+		}
 		return
 	}
 	select {
 	case sub.ch <- message:
-		sub.mu.Unlock()
+		return
 	default:
+	}
+	if !sub.resync {
 		sub.lagged = true
 		sub.done = true
 		close(sub.ch)
-		sub.mu.Unlock()
 		delete(s.subs, sub)
+		return
 	}
+	// Full, and this subscriber would rather repaint than be dropped.
+	// Whatever is already queued stays queued — the resync that follows
+	// supersedes it — so nothing here is serialized while the reader is
+	// still stalled.
+	sub.missed = true
+	s.armResyncRetryLocked()
+}
+
+// flushResyncLocked queues the terminal's exact state for a subscriber
+// that missed bytes, when there is room for it. Both locks are the
+// caller's: the session's, so the snapshot is taken atomically with the
+// stream, and the subscription's.
+//
+// Cost is bounded by how fast the subscriber reads rather than by how
+// fast the session writes: while its buffer stays full nothing is
+// serialized at all, and one slot freed yields one snapshot.
+//
+// Correct for the same reason the drop is: deliver is the only producer,
+// and it holds the session lock. The state serialized here therefore
+// includes every message discarded behind it, and no discarded bytes can
+// be queued after it — the subscriber sees exact state, then deltas.
+func (sub *Subscription) flushResyncLocked(s *Session) {
+	if sub.done || !sub.missed || len(sub.ch) == cap(sub.ch) {
+		return
+	}
+	snapshot := s.snapshotLocked()
+	sub.ch <- Message{Resync: &snapshot}
+	sub.missed = false
 }
 
 // finish ends the stream normally.

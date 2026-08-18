@@ -1,6 +1,8 @@
 package server
 
 import (
+	"encoding/json"
+	"errors"
 	"log"
 	"net"
 	"os"
@@ -131,6 +133,215 @@ func TestFullStackRoundTrip(t *testing.T) {
 	if sessions, _ := c.List(); len(sessions) != 0 {
 		t.Fatalf("session survived Remove: %v", sessions)
 	}
+}
+
+// TestTwoAttachmentsShareOneSession pins the contract a second front end
+// leans on: two live attachments on one session are peers. Both see every
+// byte, either can type, a resize by one moves the terminal under both,
+// and one detaching is invisible to the other.
+func TestTwoAttachmentsShareOneSession(t *testing.T) {
+	c := startStack(t)
+	info, err := c.Spawn(wire.Request{
+		Command: "/bin/sh",
+		Args:    []string{"-c", `printf 'both here\n'; while read line; do printf 'got:%s\n' "$line"; done`},
+		Cols:    80,
+		Rows:    24,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	a, err := c.Attach(info.ID, 64)
+	if err != nil {
+		t.Fatalf("Attach a: %v", err)
+	}
+	defer a.Close()
+	b, err := c.Attach(info.ID, 64)
+	if err != nil {
+		t.Fatalf("Attach b: %v", err)
+	}
+
+	// Input from either attachment reaches the child, and the reply
+	// reaches both — neither is a spectator of the other's typing.
+	if err := a.Write([]byte("from a\r")); err != nil {
+		t.Fatalf("Write a: %v", err)
+	}
+	drainUntil(t, a, "got:from a")
+	drainUntil(t, b, "got:from a")
+
+	if err := b.Write([]byte("from b\r")); err != nil {
+		t.Fatalf("Write b: %v", err)
+	}
+	drainUntil(t, a, "got:from b")
+	drainUntil(t, b, "got:from b")
+
+	// One terminal, one size: a resize requested through one attachment
+	// is announced to both, because it moved the session itself.
+	sizesA := make(chan [2]int, 4)
+	sizesB := make(chan [2]int, 4)
+	a.OnResize(func(cols, rows int) { sizesA <- [2]int{cols, rows} })
+	b.OnResize(func(cols, rows int) { sizesB <- [2]int{cols, rows} })
+	if err := a.Resize(120, 40); err != nil {
+		t.Fatalf("Resize a: %v", err)
+	}
+	for name, sizes := range map[string]chan [2]int{"a": sizesA, "b": sizesB} {
+		select {
+		case size := <-sizes:
+			if size != [2]int{120, 40} {
+				t.Fatalf("attachment %s saw resize %v, want 120x40", name, size)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("attachment %s never heard about the resize", name)
+		}
+	}
+
+	// Detaching one leaves the session and the other attachment intact.
+	b.Close()
+	if err := a.Write([]byte("after b left\r")); err != nil {
+		t.Fatalf("Write after detach: %v", err)
+	}
+	drainUntil(t, a, "got:after b left")
+}
+
+// rawAttach opens an attach connection by hand and reads the snapshot the
+// daemon answers with. Tests about falling behind cannot use the client:
+// its read loop drains the socket into a buffer of its own, which is
+// exactly the backpressure under test.
+func rawAttach(t *testing.T, socket string, request wire.AttachRequest) net.Conn {
+	t.Helper()
+	conn, err := net.Dial("unix", socket)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	if err := wire.WriteJSON(conn, wire.FrameAttach, request); err != nil {
+		t.Fatalf("attach frame: %v", err)
+	}
+	frameType, _, err := wire.ReadFrame(conn)
+	if err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	if frameType != wire.FrameSnapshot {
+		t.Fatalf("attach answered with frame %d, want a snapshot", frameType)
+	}
+	return conn
+}
+
+// replayFrames rebuilds what a replica of this attachment would be
+// showing: output frames append, and a snapshot frame replaces everything
+// — which is the whole contract a resync rests on. It reads until the
+// replica contains want, or the budget runs out, or the daemon hangs up.
+func replayFrames(t *testing.T, conn net.Conn, want string, budget time.Duration) (replica string, snapshots int, live bool) {
+	t.Helper()
+	var screen strings.Builder
+	deadline := time.Now().Add(budget)
+	for {
+		if strings.Contains(stripANSI(screen.String()), want) {
+			return screen.String(), snapshots, true
+		}
+		lull := time.Until(deadline)
+		if lull <= 0 {
+			return screen.String(), snapshots, true
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(lull)); err != nil {
+			t.Fatalf("set deadline: %v", err)
+		}
+		frameType, payload, err := wire.ReadFrame(conn)
+		if err != nil {
+			var timeout net.Error
+			if errors.As(err, &timeout) && timeout.Timeout() {
+				return screen.String(), snapshots, true
+			}
+			return screen.String(), snapshots, false
+		}
+		switch frameType {
+		case wire.FrameSnapshot:
+			snapshots++
+			var state wire.SnapshotPayload
+			if err := json.Unmarshal(payload, &state); err != nil {
+				t.Fatalf("malformed snapshot: %v", err)
+			}
+			screen.Reset()
+			screen.Write(state.ANSI)
+		case wire.FrameOutput:
+			screen.Write(payload)
+		}
+	}
+}
+
+// TestFallingBehindDropsAPlainClientAndResyncsAnAskingOne is the wire-level
+// contract for a client slower than its session. Both attachments below
+// stop reading under the same flood; what happens next is the difference
+// the GUI depends on.
+//
+// The plain attachment is dropped, and — the historical behavior, pinned
+// here rather than endorsed — nothing on the wire says so: the connection
+// stays open and simply never speaks again (see #15). The attachment that
+// asked to resync is handed the terminal's exact state instead and stays
+// live.
+func TestFallingBehindDropsAPlainClientAndResyncsAnAskingOne(t *testing.T) {
+	socket := startDaemon(t)
+	c, err := client.Dial(socket)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	info, err := c.Spawn(wire.Request{
+		Command: "/bin/sh",
+		Args: []string{"-c",
+			`awk 'BEGIN{for(i=0;i<40000;i++) printf "flood %d\n", i}'; printf 'FLOODOVER\n'; sleep 60`},
+		Cols: 80,
+		Rows: 24,
+		// A short quiet window: the flood is the last thing this session
+		// says, so going idle is what carries a pending resync.
+		IdleAfterMS: 200,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	plain := rawAttach(t, socket, wire.AttachRequest{ID: info.ID, Buffer: 1})
+	resyncing := rawAttach(t, socket, wire.AttachRequest{ID: info.ID, Buffer: 1, Resync: true})
+
+	// Neither connection is read while the flood runs: the daemon's
+	// one-message buffer fills behind the socket's, and both attachments
+	// fall behind for real.
+	time.Sleep(500 * time.Millisecond)
+
+	plainReplica, plainSnapshots, plainLive := replayFrames(t, plain, "FLOODOVER", 2*time.Second)
+	if !plainLive {
+		t.Fatal("the daemon hung up on a lagged attachment; it used to go quiet instead")
+	}
+	if plainSnapshots > 0 {
+		t.Fatal("a plain attachment must never be sent a second snapshot")
+	}
+	if strings.Contains(stripANSI(plainReplica), "FLOODOVER") {
+		t.Fatal("the plain attachment kept streaming; it was supposed to be dropped mid-flood")
+	}
+
+	// The resyncing attachment ends up whole: whether the tail reached it
+	// as state or as the bytes behind it, the replica has no hole in it.
+	resyncReplica, resyncSnapshots, resyncLive := replayFrames(t, resyncing, "FLOODOVER", 15*time.Second)
+	if !resyncLive {
+		t.Fatal("a resyncing attachment must stay attached, not be hung up on")
+	}
+	if resyncSnapshots == 0 {
+		t.Fatal("a resyncing attachment that fell behind was sent no state at all")
+	}
+	if state := stripANSI(resyncReplica); !strings.Contains(state, "FLOODOVER") {
+		t.Fatalf("the replica never caught up to the session:\n%s", lastLines(state, 5))
+	}
+}
+
+// lastLines trims a terminal dump to its final few lines for a failure
+// message; a whole screen of flood helps nobody.
+func lastLines(text string, count int) string {
+	lines := strings.Split(strings.TrimRight(text, "\n "), "\n")
+	if len(lines) > count {
+		lines = lines[len(lines)-count:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 func TestExitReachesAttachedClient(t *testing.T) {

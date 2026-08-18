@@ -298,16 +298,41 @@ type Attachment struct {
 	resizeMu      sync.Mutex
 	onResize      func(cols, rows int)
 	pendingResize *wire.ResizePayload
+
+	resyncMu      sync.Mutex
+	onResync      func(wire.SnapshotPayload)
+	pendingResync *wire.SnapshotPayload
+}
+
+// AttachOptions configures an attachment. The zero value is the plain
+// attach: the default buffer, dropped by the daemon on lag.
+type AttachOptions struct {
+	// Buffer is the subscriber's chunk buffer; 0 means the daemon's
+	// default.
+	Buffer int
+	// Resync keeps the attachment alive when it falls behind, at the cost
+	// of the bytes it missed: instead of the stream ending, OnResync
+	// receives the terminal's exact state at that moment and Output
+	// continues from there. A client that asks for it must register
+	// OnResync and replace its replica when it fires — otherwise it will
+	// silently render a terminal that skipped a stretch of output.
+	Resync bool
 }
 
 // Attach opens a dedicated connection to one session and returns after
 // the snapshot has arrived; Output then carries everything since it.
 func (c *Client) Attach(id string, buffer int) (*Attachment, error) {
+	return c.AttachWith(id, AttachOptions{Buffer: buffer})
+}
+
+// AttachWith is Attach with a policy: see AttachOptions.
+func (c *Client) AttachWith(id string, options AttachOptions) (*Attachment, error) {
 	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
-	if err := wire.WriteJSON(conn, wire.FrameAttach, wire.AttachRequest{ID: id, Buffer: buffer}); err != nil {
+	request := wire.AttachRequest{ID: id, Buffer: options.Buffer, Resync: options.Resync}
+	if err := wire.WriteJSON(conn, wire.FrameAttach, request); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -362,6 +387,38 @@ func (a *Attachment) OnResize(handler func(cols, rows int)) {
 	}
 }
 
+// OnResync registers the handler for a resync: the attachment fell far
+// enough behind that the daemon replaced its backlog with exact state
+// (see AttachOptions.Resync). The handler runs on the read loop, ahead of
+// the output that follows it, and its argument replaces the replica —
+// scrollback, screen, cursor and size — rather than appending to it. A
+// resync that arrived before registration is delivered immediately.
+//
+// Only attachments that asked to resync ever see one; without the option
+// the stream simply ends instead.
+func (a *Attachment) OnResync(handler func(wire.SnapshotPayload)) {
+	a.resyncMu.Lock()
+	pending := a.pendingResync
+	a.pendingResync = nil
+	a.onResync = handler
+	a.resyncMu.Unlock()
+	if pending != nil && handler != nil {
+		handler(*pending)
+	}
+}
+
+func (a *Attachment) handleResync(payload wire.SnapshotPayload) {
+	a.resyncMu.Lock()
+	handler := a.onResync
+	if handler == nil {
+		a.pendingResync = &payload
+	}
+	a.resyncMu.Unlock()
+	if handler != nil {
+		handler(payload)
+	}
+}
+
 func (a *Attachment) handleResize(payload wire.ResizePayload) {
 	a.resizeMu.Lock()
 	handler := a.onResize
@@ -406,6 +463,12 @@ func (a *Attachment) readLoop() {
 		switch frameType {
 		case wire.FrameOutput:
 			a.output <- payload
+		case wire.FrameSnapshot:
+			// A snapshot after the attach-time one is a resync.
+			var state wire.SnapshotPayload
+			if err := json.Unmarshal(payload, &state); err == nil {
+				a.handleResync(state)
+			}
 		case wire.FrameResize:
 			var moved wire.ResizePayload
 			if err := json.Unmarshal(payload, &moved); err == nil {
