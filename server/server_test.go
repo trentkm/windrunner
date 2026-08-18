@@ -671,3 +671,62 @@ func TestResizeNoticeReachesAttachedClients(t *testing.T) {
 		t.Fatalf("late resize notice = %v, want 100x30", size)
 	}
 }
+
+// TestADaemonRefusesWhatItCannotFullyRead: a daemon outlives the client
+// that started it, so a client newer than the daemon is the ordinary
+// case. Ignoring the part it cannot read means spawning a session that is
+// subtly not the one asked for — an environment quietly absent, found out
+// later as something failing three layers away with no mention of a
+// daemon.
+func TestADaemonRefusesWhatItCannotFullyRead(t *testing.T) {
+	socket := startDaemon(t)
+	conn, err := net.Dial("unix", socket)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// A spawn from a client that knows a field this daemon does not.
+	future := map[string]any{
+		"op":                  "spawn",
+		"command":             "/bin/sh",
+		"cols":                80,
+		"rows":                24,
+		"env_from_the_future": []string{"WHO=knows"},
+	}
+	if err := wire.WriteJSON(conn, wire.FrameControl, future); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	frameType, payload, err := wire.ReadFrame(conn)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if frameType != wire.FrameError {
+		t.Fatalf("a request it cannot read must be refused, got frame %d: %s",
+			frameType, payload)
+	}
+	message := string(payload)
+	// The message has to name the field and say what to do, because the
+	// caller is a program and the person reading it is three layers away.
+	for _, want := range []string{"env_from_the_future", "older", "restart"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("error should explain itself: %s", message)
+		}
+	}
+}
+
+// TestAnOrdinarySpawnStillWorks: refusing the unknown must not refuse the
+// known.
+func TestAnOrdinarySpawnStillWorks(t *testing.T) {
+	c := startStack(t)
+	if _, err := c.Spawn(wire.Request{
+		Command:     "/bin/sh",
+		Args:        []string{"-c", "sleep 60"},
+		Cols:        80,
+		Rows:        24,
+		EnvOverride: []string{"A=1"},
+		Metadata:    map[string]string{"name": "ordinary"},
+	}); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+}
