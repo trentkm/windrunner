@@ -286,6 +286,61 @@ func TestInheritedSessionIDLosesToTheRealOne(t *testing.T) {
 	}
 }
 
+// TestEnvOverrideLandsOnTopOfTheInheritedEnvironment: the primitive a
+// client on another machine needs. It cannot send its own environ — that
+// one describes a different host — and it cannot send nothing, because
+// replacing the daemon's would leave the child without PATH. So it sends
+// the handful of variables it means, and the rest is the daemon's.
+func TestEnvOverrideLandsOnTopOfTheInheritedEnvironment(t *testing.T) {
+	t.Setenv("WR_TEST_INHERITED", "from-the-daemon")
+	t.Setenv("WR_TEST_REPLACED", "stale")
+	engine := newTestEngine(t)
+	s, err := engine.Spawn(SpawnSpec{
+		Command: "/bin/sh",
+		Args:    []string{"-c", `printf 'env:%s:%s:%s:end\n' "$WR_TEST_INHERITED" "$WR_TEST_REPLACED" "$WR_TEST_ADDED"; sleep 60`},
+		EnvOverride: []string{
+			"WR_TEST_REPLACED=fresh",
+			"WR_TEST_ADDED=new",
+		},
+		Cols: 80,
+		Rows: 24,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	waitFor(t, "the child's environment", func() bool {
+		return strings.Contains(sessionText(s), ":end")
+	})
+	if want := "env:from-the-daemon:fresh:new:end"; !strings.Contains(sessionText(s), want) {
+		t.Fatalf("want %q in:\n%s", want, sessionText(s))
+	}
+	// One entry per variable: a shell reads the last, but anything
+	// reading the slice sees a duplicate as a contradiction.
+	if text := sessionText(s); strings.Count(text, "stale") != 0 {
+		t.Fatalf("replaced value survived:\n%s", text)
+	}
+}
+
+// TestEnvOverrideCannotForgeTheSessionID: the override is applied before
+// the engine stamps identity, so it stays a way to add variables and
+// never a way to claim another session.
+func TestEnvOverrideCannotForgeTheSessionID(t *testing.T) {
+	engine := newTestEngine(t)
+	s, err := engine.Spawn(SpawnSpec{
+		Command:     "/bin/sh",
+		Args:        []string{"-c", `printf 'sid:%s:end\n' "$WINDRUNNER_SESSION"; sleep 60`},
+		EnvOverride: []string{"WINDRUNNER_SESSION=somebody-elses-session"},
+		Cols:        80,
+		Rows:        24,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	waitFor(t, "the session's own id in the child env", func() bool {
+		return strings.Contains(sessionText(s), "sid:"+s.ID()+":end")
+	})
+}
+
 func TestMetadataRoundTrips(t *testing.T) {
 	engine := newTestEngine(t)
 	s, err := engine.Spawn(SpawnSpec{

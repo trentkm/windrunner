@@ -104,16 +104,17 @@ func handle(engine *windrunner.Engine, request wire.Request, cfg config) wire.Re
 	switch request.Op {
 	case "spawn":
 		s, err := engine.Spawn(windrunner.SpawnSpec{
-			Command:    request.Command,
-			Args:       request.Args,
-			Dir:        request.Dir,
-			Env:        request.Env,
-			Cols:       request.Cols,
-			Rows:       request.Rows,
-			Scrollback: request.Scrollback,
-			IdleAfter:  time.Duration(request.IdleAfterMS) * time.Millisecond,
-			Metadata:   request.Metadata,
-			Peer:       request.Peer,
+			Command:     request.Command,
+			Args:        request.Args,
+			Dir:         request.Dir,
+			Env:         request.Env,
+			EnvOverride: request.EnvOverride,
+			Cols:        request.Cols,
+			Rows:        request.Rows,
+			Scrollback:  request.Scrollback,
+			IdleAfter:   time.Duration(request.IdleAfterMS) * time.Millisecond,
+			Metadata:    request.Metadata,
+			Peer:        request.Peer,
 		})
 		if err != nil {
 			return wire.Response{Error: err.Error()}

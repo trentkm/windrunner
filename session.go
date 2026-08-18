@@ -41,8 +41,16 @@ type SpawnSpec struct {
 	// emulates. WINDRUNNER_SESSION is always this session's own ID, and
 	// any inherited one is replaced, so a session's process can name
 	// itself to the control plane and cannot name someone else.
-	Env        []string
-	Cols, Rows int
+	Env []string
+	// EnvOverride is applied on top of Env — or on top of the inherited
+	// environment when Env is nil — replacing any entry that names the
+	// same variable. It is how a caller adds a few variables without
+	// having to supply the whole environment, which a client on another
+	// machine cannot meaningfully do: its own environ describes a
+	// different host, and replacing the daemon's would leave the child
+	// without PATH, HOME, or anything else it was going to need.
+	EnvOverride []string
+	Cols, Rows  int
 	// Scrollback caps emulator history in lines; 0 means
 	// DefaultScrollback.
 	Scrollback int
@@ -124,6 +132,13 @@ func startSession(id string, spec SpawnSpec, publish func(Event)) (*Session, err
 	env := spec.Env
 	if env == nil {
 		env = os.Environ()
+	}
+	for _, entry := range spec.EnvOverride {
+		name, _, ok := strings.Cut(entry, "=")
+		if !ok || name == "" {
+			continue
+		}
+		env = append(envWithout(env, name), entry)
 	}
 	if !envHas(env, "TERM") {
 		env = append(env, "TERM=xterm-256color")
