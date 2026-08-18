@@ -2,6 +2,7 @@ package windrunner
 
 import (
 	"bytes"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -258,6 +259,31 @@ func TestChildKnowsItsOwnSession(t *testing.T) {
 	waitFor(t, "session id in child env", func() bool {
 		return strings.Contains(sessionText(s), "sid:"+s.ID()+":end")
 	})
+}
+
+// TestInheritedSessionIDLosesToTheRealOne: spawning from inside a session
+// carries WINDRUNNER_SESSION in the environment, and the child must still
+// be told the session it is actually in. Letting the inherited value win
+// attributes a nested session's audited peer sends to its grandparent —
+// and hides itself, because a clean environment never reproduces it.
+func TestInheritedSessionIDLosesToTheRealOne(t *testing.T) {
+	engine := newTestEngine(t)
+	s, err := engine.Spawn(SpawnSpec{
+		Command: "/bin/sh",
+		Args:    []string{"-c", `printf 'sid:%s:end\n' "$WINDRUNNER_SESSION"; sleep 60`},
+		Env:     append(os.Environ(), "WINDRUNNER_SESSION=somebody-elses-session"),
+		Cols:    80,
+		Rows:    24,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	waitFor(t, "the session's own id in the child env", func() bool {
+		return strings.Contains(sessionText(s), "sid:"+s.ID()+":end")
+	})
+	if text := sessionText(s); strings.Contains(text, "somebody-elses-session") {
+		t.Fatalf("child kept the inherited session id:\n%s", text)
+	}
 }
 
 func TestMetadataRoundTrips(t *testing.T) {

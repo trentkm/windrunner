@@ -38,9 +38,9 @@ type SpawnSpec struct {
 	// Env is the child's environment; nil inherits the engine process's.
 	// TERM is set to xterm-256color unless the caller provides one — the
 	// child must describe output for the terminal windrunner actually
-	// emulates. WINDRUNNER_SESSION is set to the session's ID unless the
-	// caller provides one, so a session's process can name itself to the
-	// control plane.
+	// emulates. WINDRUNNER_SESSION is always this session's own ID, and
+	// any inherited one is replaced, so a session's process can name
+	// itself to the control plane and cannot name someone else.
 	Env        []string
 	Cols, Rows int
 	// Scrollback caps emulator history in lines; 0 means
@@ -128,9 +128,12 @@ func startSession(id string, spec SpawnSpec, publish func(Event)) (*Session, err
 	if !envHas(env, "TERM") {
 		env = append(env, "TERM=xterm-256color")
 	}
-	if !envHas(env, "WINDRUNNER_SESSION") {
-		env = append(env, "WINDRUNNER_SESSION="+id)
-	}
+	// The session's ID is the engine's fact, not the caller's. A spawn
+	// from inside another session inherits WINDRUNNER_SESSION through the
+	// environment, and letting that win tells the child it belongs to its
+	// grandparent — the attribution behind every audited peer send. Drop
+	// any inherited copy and stamp this session's own.
+	env = append(envWithout(env, "WINDRUNNER_SESSION"), "WINDRUNNER_SESSION="+id)
 	cmd.Env = env
 
 	ptyFile, err := pty.StartWithSize(cmd, &pty.Winsize{
@@ -177,6 +180,21 @@ func startSession(id string, spec SpawnSpec, publish func(Event)) (*Session, err
 	go s.respondLoop()
 	go s.waitLoop()
 	return s, nil
+}
+
+// envWithout copies env, dropping every entry naming the variable. The
+// copy matters: appending onto a caller's slice can write into an array
+// it still holds.
+func envWithout(env []string, name string) []string {
+	prefix := name + "="
+	kept := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	return kept
 }
 
 func envHas(env []string, name string) bool {
