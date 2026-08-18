@@ -18,25 +18,56 @@ import (
 // Client is a control-plane connection to a daemon. Safe for concurrent
 // use; calls are serialized on the wire.
 type Client struct {
-	socketPath string
+	dial Dialer
 
 	mu   sync.Mutex
 	conn net.Conn
 }
 
+// A Dialer opens one connection to a daemon. The client makes one for its
+// control plane and one more for every attachment and event stream, so a
+// Dialer must be safe to call repeatedly and concurrently, and every
+// connection it returns must reach the same daemon.
+//
+// Control calls are bounded by a deadline, so the returned connection has
+// to honor SetDeadline. A transport built on pipes or process stdio gets
+// that from the *os.File underneath; one that silently ignores deadlines
+// turns an unanswerable call into a permanent hang.
+type Dialer func() (net.Conn, error)
+
+// UnixDialer dials a daemon's unix socket: the local transport, and the
+// default.
+func UnixDialer(socketPath string) Dialer {
+	return func() (net.Conn, error) { return net.Dial("unix", socketPath) }
+}
+
 // Dial connects to a daemon's socket.
 func Dial(socketPath string) (*Client, error) {
-	conn, err := net.Dial("unix", socketPath)
+	return DialWith(UnixDialer(socketPath))
+}
+
+// DialWith connects over an arbitrary transport. The wire protocol asks
+// nothing of a connection beyond an ordered, reliable, full-duplex byte
+// stream, so a daemon reached through a tunnel — an SSH bridge splicing
+// stdio to a remote socket, a pipe to an in-process listener — is the
+// same daemon to every call below.
+func DialWith(dial Dialer) (*Client, error) {
+	conn, err := dial()
 	if err != nil {
 		return nil, err
 	}
-	return &Client{socketPath: socketPath, conn: conn}, nil
+	return &Client{dial: dial, conn: conn}, nil
 }
 
 // EnsureDaemon dials the socket, starting the daemon if nothing answers.
 // daemonArgv is the command that runs it (typically the calling binary
 // with a "daemon" subcommand); it is started detached and given until the
 // timeout to open the socket.
+//
+// It is deliberately local-only: starting a daemon means running a
+// process beside the caller, which no tunnel can do for the far end. A
+// transport that reaches a remote daemon is responsible for ensuring one
+// is there — typically by running EnsureDaemon on that host.
 func EnsureDaemon(socketPath string, daemonArgv []string, timeout time.Duration) (*Client, error) {
 	if c, err := Dial(socketPath); err == nil {
 		return c, nil
@@ -197,7 +228,7 @@ type EventStream struct {
 // session lifecycle (spawned, exited, removed) and activity (idle, busy).
 // It returns once the daemon has acked, so no event after that is missed.
 func (c *Client) Subscribe(buffer int) (*EventStream, error) {
-	conn, err := net.Dial("unix", c.socketPath)
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
@@ -272,7 +303,7 @@ type Attachment struct {
 // Attach opens a dedicated connection to one session and returns after
 // the snapshot has arrived; Output then carries everything since it.
 func (c *Client) Attach(id string, buffer int) (*Attachment, error) {
-	conn, err := net.Dial("unix", c.socketPath)
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
