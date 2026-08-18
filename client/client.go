@@ -289,19 +289,34 @@ func (stream *EventStream) readLoop() {
 type Attachment struct {
 	conn     net.Conn
 	snapshot wire.SnapshotPayload
-	output   chan []byte
+	output   chan Message
 	exited   chan int
 
 	writeMu sync.Mutex
 	once    sync.Once
+}
 
-	resizeMu      sync.Mutex
-	onResize      func(cols, rows int)
-	pendingResize *wire.ResizePayload
-
-	resyncMu      sync.Mutex
-	onResync      func(wire.SnapshotPayload)
-	pendingResync *wire.SnapshotPayload
+// Message is one delivery on an attachment's stream. Exactly one of its
+// fields is set, and the order they arrive in is the order the daemon
+// sent them.
+//
+// That ordering is the whole reason this is a stream rather than a
+// channel of bytes plus a callback for the rest. A resync means "replace
+// your replica with this"; output means "append this". Deliver them by
+// two routes and the queued output of a slow client — the only kind that
+// ever gets a resync — lands on top of the state that superseded it, and
+// the replica is wrong from then on with nothing to correct it.
+type Message struct {
+	// Bytes is terminal output to append to the replica.
+	Bytes []byte
+	// Resize is the session's new size, arriving just ahead of the
+	// repaint that follows it.
+	Resize *wire.ResizePayload
+	// Resync replaces the replica wholesale — screen, scrollback, cursor
+	// and size — because this attachment fell behind and the daemon sent
+	// state instead of the bytes it missed. Only attachments that asked
+	// for it ever see one.
+	Resync *wire.SnapshotPayload
 }
 
 // AttachOptions configures an attachment. The zero value is the plain
@@ -311,11 +326,11 @@ type AttachOptions struct {
 	// default.
 	Buffer int
 	// Resync keeps the attachment alive when it falls behind, at the cost
-	// of the bytes it missed: instead of the stream ending, OnResync
-	// receives the terminal's exact state at that moment and Output
-	// continues from there. A client that asks for it must register
-	// OnResync and replace its replica when it fires — otherwise it will
-	// silently render a terminal that skipped a stretch of output.
+	// of the bytes it missed: instead of the stream ending, a Message
+	// carrying the terminal's exact state arrives in line and the stream
+	// continues from there. A client that asks for it must handle
+	// Message.Resync by replacing its replica — one that ignores the
+	// field silently renders a terminal with a hole in it.
 	Resync bool
 }
 
@@ -353,7 +368,7 @@ func (c *Client) AttachWith(id string, options AttachOptions) (*Attachment, erro
 	}
 	a := &Attachment{
 		conn:   conn,
-		output: make(chan []byte, 64),
+		output: make(chan Message, 64),
 		exited: make(chan int, 1),
 	}
 	if err := json.Unmarshal(payload, &a.snapshot); err != nil {
@@ -367,69 +382,14 @@ func (c *Client) AttachWith(id string, options AttachOptions) (*Attachment, erro
 // Snapshot is the session's exact state at attach time.
 func (a *Attachment) Snapshot() wire.SnapshotPayload { return a.snapshot }
 
-// Output carries raw terminal bytes since the snapshot; it closes when
-// the attachment ends.
-func (a *Attachment) Output() <-chan []byte { return a.output }
-
-// OnResize registers the handler for session resizes that arrive over the
-// stream — the session's terminal moved, whoever moved it. The handler
-// runs on the read loop, ahead of the repaint bytes the resize travels
-// with; a resize that arrived before registration is delivered
-// immediately.
-func (a *Attachment) OnResize(handler func(cols, rows int)) {
-	a.resizeMu.Lock()
-	pending := a.pendingResize
-	a.pendingResize = nil
-	a.onResize = handler
-	a.resizeMu.Unlock()
-	if pending != nil && handler != nil {
-		handler(pending.Cols, pending.Rows)
-	}
-}
-
-// OnResync registers the handler for a resync: the attachment fell far
-// enough behind that the daemon replaced its backlog with exact state
-// (see AttachOptions.Resync). The handler runs on the read loop, ahead of
-// the output that follows it, and its argument replaces the replica —
-// scrollback, screen, cursor and size — rather than appending to it. A
-// resync that arrived before registration is delivered immediately.
+// Output carries everything the session says after the attach snapshot,
+// in order: output to append, resizes, and — for an attachment that asked
+// to resync — state that replaces the replica. It closes when the
+// attachment ends.
 //
-// Only attachments that asked to resync ever see one; without the option
-// the stream simply ends instead.
-func (a *Attachment) OnResync(handler func(wire.SnapshotPayload)) {
-	a.resyncMu.Lock()
-	pending := a.pendingResync
-	a.pendingResync = nil
-	a.onResync = handler
-	a.resyncMu.Unlock()
-	if pending != nil && handler != nil {
-		handler(*pending)
-	}
-}
-
-func (a *Attachment) handleResync(payload wire.SnapshotPayload) {
-	a.resyncMu.Lock()
-	handler := a.onResync
-	if handler == nil {
-		a.pendingResync = &payload
-	}
-	a.resyncMu.Unlock()
-	if handler != nil {
-		handler(payload)
-	}
-}
-
-func (a *Attachment) handleResize(payload wire.ResizePayload) {
-	a.resizeMu.Lock()
-	handler := a.onResize
-	if handler == nil {
-		a.pendingResize = &payload
-	}
-	a.resizeMu.Unlock()
-	if handler != nil {
-		handler(payload.Cols, payload.Rows)
-	}
-}
+// One stream rather than a channel plus callbacks, deliberately: see
+// Message.
+func (a *Attachment) Output() <-chan Message { return a.output }
 
 // Exited yields the process's exit code if it ends while attached.
 func (a *Attachment) Exited() <-chan int { return a.exited }
@@ -462,17 +422,21 @@ func (a *Attachment) readLoop() {
 		}
 		switch frameType {
 		case wire.FrameOutput:
-			a.output <- payload
+			a.output <- Message{Bytes: payload}
 		case wire.FrameSnapshot:
-			// A snapshot after the attach-time one is a resync.
+			// A snapshot after the attach-time one is a resync. A
+			// malformed one ends the stream rather than being skipped:
+			// silently dropping it would leave everything after it
+			// appended to a replica this state was meant to replace.
 			var state wire.SnapshotPayload
-			if err := json.Unmarshal(payload, &state); err == nil {
-				a.handleResync(state)
+			if err := json.Unmarshal(payload, &state); err != nil {
+				return
 			}
+			a.output <- Message{Resync: &state}
 		case wire.FrameResize:
 			var moved wire.ResizePayload
 			if err := json.Unmarshal(payload, &moved); err == nil {
-				a.handleResize(moved)
+				a.output <- Message{Resize: &moved}
 			}
 		case wire.FrameExited:
 			var exited wire.ExitedPayload

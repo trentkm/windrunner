@@ -57,17 +57,45 @@ func startDaemon(t *testing.T, options ...Option) string {
 	return socket
 }
 
+// awaitResize drains an attachment until the session's new size arrives.
+// Sizes ride the stream in order, so reaching one means reading past the
+// output ahead of it — which is the point: the notice lands just before
+// the repaint it belongs to.
+func awaitResize(t *testing.T, a *client.Attachment) [2]int {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case message, ok := <-a.Output():
+			if !ok {
+				t.Fatal("stream closed before a resize arrived")
+			}
+			if message.Resize != nil {
+				return [2]int{message.Resize.Cols, message.Resize.Rows}
+			}
+		case <-deadline:
+			t.Fatal("no resize reached the attachment")
+		}
+	}
+}
+
 func drainUntil(t *testing.T, a *client.Attachment, want string) string {
 	t.Helper()
 	var collected strings.Builder
 	deadline := time.After(5 * time.Second)
 	for !strings.Contains(stripANSI(collected.String()), want) {
 		select {
-		case chunk, ok := <-a.Output():
+		case message, ok := <-a.Output():
 			if !ok {
 				t.Fatalf("stream closed before %q arrived; got %q", want, collected.String())
 			}
-			collected.Write(chunk)
+			if message.Resync != nil {
+				// State replaces what came before it, here as everywhere.
+				collected.Reset()
+				collected.Write(message.Resync.ANSI)
+				continue
+			}
+			collected.Write(message.Bytes)
 		case <-deadline:
 			t.Fatalf("timed out waiting for %q; got %q", want, stripANSI(collected.String()))
 		}
@@ -177,21 +205,12 @@ func TestTwoAttachmentsShareOneSession(t *testing.T) {
 
 	// One terminal, one size: a resize requested through one attachment
 	// is announced to both, because it moved the session itself.
-	sizesA := make(chan [2]int, 4)
-	sizesB := make(chan [2]int, 4)
-	a.OnResize(func(cols, rows int) { sizesA <- [2]int{cols, rows} })
-	b.OnResize(func(cols, rows int) { sizesB <- [2]int{cols, rows} })
 	if err := a.Resize(120, 40); err != nil {
 		t.Fatalf("Resize a: %v", err)
 	}
-	for name, sizes := range map[string]chan [2]int{"a": sizesA, "b": sizesB} {
-		select {
-		case size := <-sizes:
-			if size != [2]int{120, 40} {
-				t.Fatalf("attachment %s saw resize %v, want 120x40", name, size)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("attachment %s never heard about the resize", name)
+	for name, attachment := range map[string]*client.Attachment{"a": a, "b": b} {
+		if size := awaitResize(t, attachment); size != [2]int{120, 40} {
+			t.Fatalf("attachment %s saw resize %v, want 120x40", name, size)
 		}
 	}
 
@@ -623,47 +642,32 @@ func TestResizeNoticeReachesAttachedClients(t *testing.T) {
 	}
 	defer a.Close()
 
-	sizes := make(chan [2]int, 4)
-	a.OnResize(func(cols, rows int) { sizes <- [2]int{cols, rows} })
-
 	if err := c.Resize(info.ID, 132, 43); err != nil {
 		t.Fatalf("Resize: %v", err)
 	}
-	select {
-	case size := <-sizes:
-		if size != [2]int{132, 43} {
-			t.Fatalf("resize notice = %v, want 132x43", size)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("no resize notice reached the attachment")
+	if size := awaitResize(t, a); size != [2]int{132, 43} {
+		t.Fatalf("resize notice = %v, want 132x43", size)
 	}
 	// The repaint rides right behind the notice.
 	drainUntil(t, a, "landmark")
 
-	// Late registration replays the size the stream already carried.
+	// An attachment that opens after the fact learns the size the same
+	// way: over its own stream, when the terminal next moves. Nothing is
+	// replayed, because nothing was missed — the attach snapshot already
+	// carried the size at that moment.
 	late, err := c.Attach(info.ID, 64)
 	if err != nil {
 		t.Fatalf("second Attach: %v", err)
 	}
 	defer late.Close()
+	if late.Snapshot().Cols != 132 || late.Snapshot().Rows != 43 {
+		t.Fatalf("attach snapshot carried %dx%d, want 132x43",
+			late.Snapshot().Cols, late.Snapshot().Rows)
+	}
 	if err := c.Resize(info.ID, 100, 30); err != nil {
 		t.Fatalf("second Resize: %v", err)
 	}
-	lateSizes := make(chan [2]int, 4)
-	deadline := time.After(2 * time.Second)
-	for {
-		late.OnResize(func(cols, rows int) { lateSizes <- [2]int{cols, rows} })
-		select {
-		case size := <-lateSizes:
-			if size != [2]int{100, 30} {
-				t.Fatalf("late resize notice = %v, want 100x30", size)
-			}
-			return
-		case <-deadline:
-			t.Fatal("late handler never saw the pending resize")
-		default:
-			late.OnResize(nil)
-			time.Sleep(10 * time.Millisecond)
-		}
+	if size := awaitResize(t, late); size != [2]int{100, 30} {
+		t.Fatalf("late resize notice = %v, want 100x30", size)
 	}
 }

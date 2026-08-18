@@ -112,18 +112,11 @@ func TestEveryConnectionFollowsTheDialer(t *testing.T) {
 
 			// Resize is the daemon pushing something other than output
 			// down the attachment.
-			moved := make(chan [2]int, 1)
-			a.OnResize(func(cols, rows int) { moved <- [2]int{cols, rows} })
 			if err := c.Resize(info.ID, 100, 30); err != nil {
 				t.Fatalf("Resize: %v", err)
 			}
-			select {
-			case size := <-moved:
-				if size != [2]int{100, 30} {
-					t.Fatalf("resize arrived as %v", size)
-				}
-			case <-time.After(5 * time.Second):
-				t.Fatal("resize never reached the attachment")
+			if size := awaitResize(t, a); size != [2]int{100, 30} {
+				t.Fatalf("resize arrived as %v", size)
 			}
 
 			// Input goes back up the same connection, and the reply

@@ -95,11 +95,18 @@ func (c *Client) Interactive(id string, detachKey byte) (InteractiveResult, erro
 		case code := <-attachment.Exited():
 			_ = code
 			return SessionExited, nil
-		case chunk, ok := <-attachment.Output():
+		case message, ok := <-attachment.Output():
 			if !ok {
 				return ConnectionLost, nil
 			}
-			os.Stdout.Write(chunk)
+			if message.Resync != nil {
+				// State, not output: clear before painting it, or the
+				// screen it replaces stays underneath.
+				os.Stdout.WriteString("\x1b[H\x1b[2J")
+				os.Stdout.Write(message.Resync.ANSI)
+				continue
+			}
+			os.Stdout.Write(message.Bytes)
 		}
 	}
 }

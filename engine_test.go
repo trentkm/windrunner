@@ -217,9 +217,6 @@ func TestResyncSubscriberSurvivesTheFloodItMissed(t *testing.T) {
 	waitFor(t, "flood completion", func() bool {
 		return strings.Contains(sessionText(s), "flood 500")
 	})
-	if sub.Lagged() {
-		t.Fatal("a resyncing subscriber must never be marked lagged")
-	}
 
 	// Draining eventually reaches the resync: state, not more deltas.
 	var resync *Snapshot
@@ -257,11 +254,12 @@ func TestResyncSubscriberSurvivesTheFloodItMissed(t *testing.T) {
 	}
 }
 
-// TestResyncArrivesOnceTheTerminalGoesQuiet: the burst that dropped a
+// TestResyncArrivesAfterTheOutputStops: the burst that dropped a
 // subscriber's bytes may be the last thing the session ever writes.
-// Nothing is left to carry the state it is owed, so going idle delivers
-// it — a viewer must not sit on stale state until the next keystroke.
-func TestResyncArrivesOnceTheTerminalGoesQuiet(t *testing.T) {
+// Nothing further is coming to carry the state it is owed, so the flush
+// has to come from the session's own clock — a viewer must not sit on
+// stale state until the terminal happens to move again.
+func TestResyncArrivesAfterTheOutputStops(t *testing.T) {
 	engine := newTestEngine(t)
 	s, err := engine.Spawn(SpawnSpec{
 		Command: "/bin/sh",
@@ -290,6 +288,115 @@ func TestResyncArrivesOnceTheTerminalGoesQuiet(t *testing.T) {
 		if message := nextMessage(t, sub); message.Resync != nil {
 			return
 		}
+	}
+}
+
+// TestResyncSurvivesTheStreamEnding: a session that floods and then exits
+// is the everyday case — run something noisy, watch it finish. The last
+// thing a subscriber that fell behind must receive is the terminal's
+// final state, even with no room left for it, because nothing follows to
+// correct a replica left half-drawn. Getting this wrong is invisible: the
+// stream closes normally and Lagged() reports nothing wrong.
+func TestResyncSurvivesTheStreamEnding(t *testing.T) {
+	engine := newTestEngine(t)
+	s := spawnShell(t, engine,
+		`i=0; while [ $i -le 2000 ]; do printf 'flood %d\n' $i; i=$((i+1)); done; printf 'LASTWORD\n'`)
+
+	_, sub := s.AttachWith(AttachOptions{Buffer: 1, Resync: true})
+	<-s.Done()
+
+	// Rebuild what this subscriber would be showing, by the same rule a
+	// replica follows: state replaces, bytes append. Draining to the end
+	// is the whole point — the last thing through must leave the replica
+	// correct, because there is no "next message" to fix it.
+	var replica strings.Builder
+	resynced := false
+	for message := range sub.Output() {
+		if message.Resync != nil {
+			resynced = true
+			replica.Reset()
+			replica.Write(message.Resync.ANSI)
+			continue
+		}
+		replica.Write(message.Bytes)
+	}
+	if !resynced {
+		t.Fatal("a subscriber that fell behind was never sent state")
+	}
+	if text := stripANSI(replica.String()); !strings.Contains(text, "LASTWORD") {
+		lines := strings.Split(strings.TrimRight(text, "\n "), "\n")
+		if len(lines) > 5 {
+			lines = lines[len(lines)-5:]
+		}
+		t.Fatalf("the replica's last word is not the session's:\n%s",
+			strings.Join(lines, "\n"))
+	}
+}
+
+// TestResyncDebtDiesWithTheSubscription: a viewer that lags once and then
+// disconnects is the normal path — every dashboard closing does it. If
+// its unpaid debt outlives it, the session keeps waking itself to offer
+// state to nobody, for as long as the session lives.
+func TestResyncDebtDiesWithTheSubscription(t *testing.T) {
+	engine := newTestEngine(t)
+	s := spawnShell(t, engine,
+		`i=0; while [ $i -le 500 ]; do printf 'flood %d\n' $i; i=$((i+1)); done; sleep 60`)
+
+	_, sub := s.AttachWith(AttachOptions{Buffer: 1, Resync: true})
+	waitFor(t, "the subscriber to fall behind", func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		sub.mu.Lock()
+		defer sub.mu.Unlock()
+		return sub.missed
+	})
+	sub.Close()
+
+	waitFor(t, "the session to stop re-arming its retry", func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.resyncTimer == nil
+	})
+}
+
+// TestResyncCostIsPacedNotPerRead: a viewer reading at display rate frees
+// a slot sixty times a second. Serializing state each time would charge
+// the session a full repaint per frame — under the read loop's own lock,
+// where it stalls the PTY drain and every other subscriber — on behalf of
+// the one client too slow for the raw stream.
+func TestResyncCostIsPacedNotPerRead(t *testing.T) {
+	engine := newTestEngine(t)
+	s := spawnShell(t, engine,
+		`while :; do printf 'chatter %s\n' "$i"; i=$((i+1)); done`)
+
+	_, sub := s.AttachWith(AttachOptions{Buffer: 1, Resync: true})
+	defer sub.Close()
+
+	// Read like a browser painting frames: fast, but never fast enough
+	// for an unbounded stream.
+	window := 20 * resyncInterval
+	deadline := time.Now().Add(window)
+	resyncs := 0
+	for time.Now().Before(deadline) {
+		select {
+		case message, ok := <-sub.Output():
+			if !ok {
+				t.Fatal("a resyncing subscriber was dropped")
+			}
+			if message.Resync != nil {
+				resyncs++
+			}
+		case <-time.After(resyncInterval):
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// One per interval is the design; allow generous slack for scheduling
+	// while still failing the per-read behavior, which would be an order
+	// of magnitude more.
+	if limit := 3 * int(window/resyncInterval); resyncs > limit {
+		t.Fatalf("%d resyncs in %v — paced delivery would be at most ~%d",
+			resyncs, window, limit)
 	}
 }
 
