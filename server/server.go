@@ -4,12 +4,15 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -61,9 +64,9 @@ func serveConn(engine *windrunner.Engine, conn net.Conn, cfg config) {
 		}
 		switch frameType {
 		case wire.FrameControl:
-			var request wire.Request
-			if err := json.Unmarshal(payload, &request); err != nil {
-				respondError(conn, "malformed request: "+err.Error())
+			request, err := decodeRequest(payload)
+			if err != nil {
+				respondError(conn, err.Error())
 				return
 			}
 			if err := wire.WriteJSON(conn, wire.FrameResponse, handle(engine, request, cfg)); err != nil {
@@ -98,6 +101,46 @@ func serveConn(engine *windrunner.Engine, conn net.Conn, cfg config) {
 
 func respondError(conn net.Conn, message string) {
 	_ = wire.WriteJSON(conn, wire.FrameError, wire.ErrorPayload{Error: message})
+}
+
+// decodeRequest refuses a request it does not fully understand.
+//
+// Ignoring an unknown field is the friendly-looking choice and the wrong
+// one. A daemon outlives the client that started it — that is the whole
+// point of a daemon — so a client newer than the daemon is the ordinary
+// case, not the exotic one. Silently dropping the part it cannot read
+// means spawning a session that is subtly not what was asked for: the
+// environment a caller depended on, quietly absent, discovered later as
+// something failing three layers away with no mention of a daemon.
+//
+// Refusing says which field and lets the caller say something useful —
+// that the daemon is older than the build talking to it, and restarting
+// it is the fix.
+func decodeRequest(payload []byte) (wire.Request, error) {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	var request wire.Request
+	if err := decoder.Decode(&request); err != nil {
+		if field, ok := unknownField(err); ok {
+			return wire.Request{}, fmt.Errorf(
+				"this daemon does not understand %q; it is older than the client "+
+					"talking to it, and restarting it will fix that", field)
+		}
+		return wire.Request{}, fmt.Errorf("malformed request: %w", err)
+	}
+	return request, nil
+}
+
+// unknownField pulls the field name out of encoding/json's message, which
+// says it in prose and nowhere else.
+func unknownField(err error) (string, bool) {
+	const marker = "unknown field "
+	message := err.Error()
+	index := strings.Index(message, marker)
+	if index < 0 {
+		return "", false
+	}
+	return strings.Trim(message[index+len(marker):], `"`), true
 }
 
 func handle(engine *windrunner.Engine, request wire.Request, cfg config) wire.Response {
