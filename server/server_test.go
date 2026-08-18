@@ -24,6 +24,18 @@ func stripANSI(text string) string {
 
 func startStack(t *testing.T, options ...Option) *client.Client {
 	t.Helper()
+	c, err := client.Dial(startDaemon(t, options...))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+	return c
+}
+
+// startDaemon serves an engine on a scratch socket and reports the path,
+// for tests that reach it as something other than the default client.
+func startDaemon(t *testing.T, options ...Option) string {
+	t.Helper()
 	// Not t.TempDir(): unix socket paths cap at 104 bytes on macOS, and
 	// long test names push the per-test dir past it.
 	dir, err := os.MkdirTemp("", "wr")
@@ -40,13 +52,7 @@ func startStack(t *testing.T, options ...Option) *client.Client {
 	t.Cleanup(engine.Close)
 	go Serve(engine, listener, options...)
 	t.Cleanup(func() { listener.Close() })
-
-	c, err := client.Dial(socket)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	t.Cleanup(func() { c.Close() })
-	return c
+	return socket
 }
 
 func drainUntil(t *testing.T, a *client.Attachment, want string) string {

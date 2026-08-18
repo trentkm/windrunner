@@ -26,7 +26,10 @@ extracted, embeddable, and unopinionated about what you build on top.
   logs.
 - **Bytes on the wire.** Clients receive a snapshot, then raw output bytes,
   and send raw input bytes back. Bring any front end: a Go TUI, xterm.js in
-  a browser, a recorder, a bot.
+  a browser, a recorder, a bot. The client dials through a transport you
+  supply — a unix socket by default, anything ordered and full-duplex
+  otherwise — so a daemon on the far side of an SSH bridge is the same
+  daemon to every call.
 - **Sessions carry opaque metadata.** Tag sessions with whatever your
   product means by them — task, branch, agent, owner. Windrunner stores and
   returns the bag; it never interprets it.
