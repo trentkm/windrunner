@@ -185,6 +185,17 @@ func TestLaggedSubscriberIsDroppedNotBlocking(t *testing.T) {
 	})
 }
 
+// overflow puts a subscription into debt deterministically: one message
+// to fill its buffer, a second to find it full. It drives the same path
+// the PTY read loop does — deliver under the session lock — so what it
+// exercises is the engine's behavior, not the machine's timing.
+func overflow(s *Session, sub *Subscription) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub.deliver(Message{Bytes: []byte("fills the buffer")}, s)
+	sub.deliver(Message{Bytes: []byte("finds it full")}, s)
+}
+
 // nextMessage reads one message from a subscription, or fails.
 func nextMessage(t *testing.T, sub *Subscription) Message {
 	t.Helper()
@@ -211,12 +222,16 @@ func TestResyncSubscriberSurvivesTheFloodItMissed(t *testing.T) {
 		`i=0; while [ $i -le 500 ]; do printf 'flood %d\n' $i; i=$((i+1)); done
 		 while read line; do printf 'got:%s\n' "$line"; done`)
 
-	// One message deep and unread while the flood runs: the subscription
-	// cannot help but fall behind.
-	_, sub := s.AttachWith(AttachOptions{Buffer: 1, Resync: true})
 	waitFor(t, "flood completion", func() bool {
 		return strings.Contains(sessionText(s), "flood 500")
 	})
+	// One message deep, then overflowed on purpose. Racing a shell to
+	// fall behind is how this test used to work, and it only fell behind
+	// on machines whose /bin/sh was slow enough to still be printing:
+	// dash finishes the flood before the subscriber attaches, and the
+	// test then waited forever for a resync nothing had asked for.
+	_, sub := s.AttachWith(AttachOptions{Buffer: 1, Resync: true})
+	overflow(s, sub)
 	// Falling behind is not lagging: the contract is that a resyncing
 	// subscriber is never dropped for it, and Lagged is how a caller
 	// would find out otherwise.
@@ -278,12 +293,14 @@ func TestResyncArrivesAfterTheOutputStops(t *testing.T) {
 		t.Fatalf("Spawn: %v", err)
 	}
 
-	_, sub := s.AttachWith(AttachOptions{Buffer: 1, Resync: true})
 	waitFor(t, "flood completion", func() bool {
 		return strings.Contains(sessionText(s), "flood 500")
 	})
-	// Read exactly one message to free the slot the resync needs, then
-	// stop: from here only the idle flush can deliver it.
+	_, sub := s.AttachWith(AttachOptions{Buffer: 1, Resync: true})
+	overflow(s, sub)
+	// Read exactly one message to free the slot the resync needs. The
+	// session says nothing more from here, so only the session's own
+	// clock can deliver what is owed.
 	nextMessage(t, sub)
 
 	deadline := time.Now().Add(5 * time.Second)
@@ -305,10 +322,18 @@ func TestResyncArrivesAfterTheOutputStops(t *testing.T) {
 // stream closes normally and Lagged() reports nothing wrong.
 func TestResyncSurvivesTheStreamEnding(t *testing.T) {
 	engine := newTestEngine(t)
-	s := spawnShell(t, engine,
-		`i=0; while [ $i -le 2000 ]; do printf 'flood %d\n' $i; i=$((i+1)); done; printf 'LASTWORD\n'`)
+	s := spawnShell(t, engine, `printf 'LASTWORD\n'; read line; exit 0`)
+	waitFor(t, "the session's last word", func() bool {
+		return strings.Contains(sessionText(s), "LASTWORD")
+	})
 
+	// In debt, then ended — deliberately, rather than by hoping a shell
+	// loop outruns the attach.
 	_, sub := s.AttachWith(AttachOptions{Buffer: 1, Resync: true})
+	overflow(s, sub)
+	if _, err := s.Write([]byte("go\r")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
 	<-s.Done()
 
 	// Rebuild what this subscriber would be showing, by the same rule a
@@ -345,17 +370,10 @@ func TestResyncSurvivesTheStreamEnding(t *testing.T) {
 // state to nobody, for as long as the session lives.
 func TestResyncDebtDiesWithTheSubscription(t *testing.T) {
 	engine := newTestEngine(t)
-	s := spawnShell(t, engine,
-		`i=0; while [ $i -le 500 ]; do printf 'flood %d\n' $i; i=$((i+1)); done; sleep 60`)
+	s := spawnShell(t, engine, `printf 'quiet\n'; sleep 60`)
 
 	_, sub := s.AttachWith(AttachOptions{Buffer: 1, Resync: true})
-	waitFor(t, "the subscriber to fall behind", func() bool {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		sub.mu.Lock()
-		defer sub.mu.Unlock()
-		return sub.missed
-	})
+	overflow(s, sub)
 	sub.Close()
 
 	waitFor(t, "the session to stop re-arming its retry", func() bool {
@@ -372,15 +390,33 @@ func TestResyncDebtDiesWithTheSubscription(t *testing.T) {
 // the one client too slow for the raw stream.
 func TestResyncCostIsPacedNotPerRead(t *testing.T) {
 	engine := newTestEngine(t)
-	s := spawnShell(t, engine,
-		`while :; do printf 'chatter %s\n' "$i"; i=$((i+1)); done`)
+	s := spawnShell(t, engine, `printf 'chatter\n'; sleep 60`)
 
 	_, sub := s.AttachWith(AttachOptions{Buffer: 1, Resync: true})
 	defer sub.Close()
 
+	// A producer that always has more to say, driven from here rather
+	// than from a shell: how fast /bin/sh loops decides nothing about
+	// what this measures.
+	window := 20 * resyncInterval
+	producing := make(chan struct{})
+	defer close(producing)
+	go func() {
+		for {
+			select {
+			case <-producing:
+				return
+			default:
+			}
+			s.mu.Lock()
+			sub.deliver(Message{Bytes: []byte("more output")}, s)
+			s.mu.Unlock()
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
 	// Read like a browser painting frames: fast, but never fast enough
 	// for an unbounded stream.
-	window := 20 * resyncInterval
 	deadline := time.Now().Add(window)
 	resyncs := 0
 	for time.Now().Before(deadline) {
