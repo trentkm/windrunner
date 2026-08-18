@@ -26,13 +26,13 @@ import (
 type FrameType byte
 
 const (
-	FrameControl  FrameType = 1 // JSON Request
-	FrameResponse FrameType = 2 // JSON Response
-	FrameAttach   FrameType = 3 // JSON AttachRequest
-	FrameSnapshot FrameType = 4 // JSON SnapshotPayload
-	FrameOutput   FrameType = 5 // raw terminal output
-	FrameInput    FrameType = 6 // raw terminal input
-	FrameResize   FrameType = 7 // JSON ResizePayload
+	FrameControl   FrameType = 1  // JSON Request
+	FrameResponse  FrameType = 2  // JSON Response
+	FrameAttach    FrameType = 3  // JSON AttachRequest
+	FrameSnapshot  FrameType = 4  // JSON SnapshotPayload
+	FrameOutput    FrameType = 5  // raw terminal output
+	FrameInput     FrameType = 6  // raw terminal input
+	FrameResize    FrameType = 7  // JSON ResizePayload
 	FrameExited    FrameType = 8  // JSON ExitedPayload
 	FrameError     FrameType = 9  // JSON ErrorPayload
 	FrameSubscribe FrameType = 10 // JSON SubscribeRequest
@@ -48,12 +48,17 @@ type Request struct {
 	Op string `json:"op"` // spawn, list, info, kill, remove, resize, set_metadata, input, snapshot
 
 	// spawn
-	Command    string            `json:"command,omitempty"`
-	Args       []string          `json:"args,omitempty"`
-	Dir        string            `json:"dir,omitempty"`
-	Env        []string          `json:"env,omitempty"`
-	Scrollback int               `json:"scrollback,omitempty"`
-	Metadata   map[string]string `json:"metadata,omitempty"`
+	Command string   `json:"command,omitempty"`
+	Args    []string `json:"args,omitempty"`
+	Dir     string   `json:"dir,omitempty"`
+	Env     []string `json:"env,omitempty"`
+	// spawn: variables applied on top of Env, or on top of the daemon's
+	// own environment when Env is empty. A client that is not on the
+	// daemon's machine sends its variables this way — its environ
+	// describes a different host.
+	EnvOverride []string          `json:"env_override,omitempty"`
+	Scrollback  int               `json:"scrollback,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
 	// spawn: quiet window in milliseconds behind idle/busy events; 0
 	// means the engine default.
 	IdleAfterMS int `json:"idle_after_ms,omitempty"`

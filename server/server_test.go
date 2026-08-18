@@ -249,6 +249,36 @@ func TestPeerInputIsOptIn(t *testing.T) {
 	drainUntil(t, a, "heard:attached")
 }
 
+// TestEnvOverrideCrossesTheWire: the field is one line of passthrough in
+// the spawn handler, and a client that silently loses it gets an agent
+// running with none of the variables that make it an agent.
+func TestEnvOverrideCrossesTheWire(t *testing.T) {
+	t.Setenv("WR_TEST_INHERITED", "from-the-daemon")
+	c := startStack(t)
+	info, err := c.Spawn(wire.Request{
+		Command:     "/bin/sh",
+		Args:        []string{"-c", `printf 'env:%s:%s:end\n' "$WR_TEST_INHERITED" "$WR_TEST_SENT"; sleep 60`},
+		EnvOverride: []string{"WR_TEST_SENT=over-the-wire"},
+		Cols:        80,
+		Rows:        24,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	a, err := c.Attach(info.ID, 64)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	defer a.Close()
+	combined := stripANSI(string(a.Snapshot().ANSI))
+	if !strings.Contains(combined, ":end") {
+		combined += stripANSI(drainUntil(t, a, ":end"))
+	}
+	if want := "env:from-the-daemon:over-the-wire:end"; !strings.Contains(combined, want) {
+		t.Fatalf("want %q in:\n%s", want, combined)
+	}
+}
+
 func TestEventsOverTheWire(t *testing.T) {
 	c := startStack(t)
 	stream, err := c.Subscribe(64)
