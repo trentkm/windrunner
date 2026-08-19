@@ -11,15 +11,40 @@ import (
 	"github.com/charmbracelet/x/vt"
 )
 
-func waitFor(t *testing.T, what string, condition func() bool) {
+func waitUntil(t *testing.T, limit time.Duration, what string, condition func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(limit)
 	for !condition() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// waitFor bounds something this package does. Once a child is known to be
+// running, every answer the engine owes is a matter of milliseconds, so
+// five seconds is already an enormous margin.
+func waitFor(t *testing.T, what string, condition func() bool) {
+	t.Helper()
+	waitUntil(t, 5*time.Second, what, condition)
+}
+
+// startupLimit is how long a freshly spawned child may take to say its
+// first word. Scheduling /bin/sh is not something this package does, and
+// it is not something these tests measure: on a loaded two-core runner
+// under the race detector, with every package's PTY tests competing for
+// the same cores, a shell can take longer to produce a byte than the five
+// seconds that bound the engine's own work. A test that folds start-up
+// into its deadline reports that as a failure of whatever it was actually
+// testing. So start-up waits on its own clock, set far past anything but a
+// child that never ran at all.
+const startupLimit = 45 * time.Second
+
+// waitForStart waits for a child to prove it is running. See startupLimit.
+func waitForStart(t *testing.T, what string, condition func() bool) {
+	t.Helper()
+	waitUntil(t, startupLimit, what, condition)
 }
 
 func newTestEngine(t *testing.T) *Engine {
@@ -43,6 +68,32 @@ func spawnShell(t *testing.T, engine *Engine, script string) *Session {
 	return s
 }
 
+// spawnGated spawns a shell that announces itself and then blocks on a
+// line of input before running script. It returns once the announcement
+// has landed — so the child is known to be running — along with a release
+// func that lets the script go.
+//
+// It exists because spawning and then attaching is a race the test loses
+// silently. A subscription carries what arrives after it, so a shell quick
+// off the mark puts its output in the attach snapshot instead of the
+// stream, and the test then waits out its deadline for bytes it was never
+// going to be sent. Gating puts every byte the script produces strictly
+// after the attach, and starts the clock on the far side of start-up.
+func spawnGated(t *testing.T, engine *Engine, script string) (*Session, func()) {
+	t.Helper()
+	s := spawnShell(t, engine, `printf 'gate open\n'; read _gate; `+script)
+	waitForStart(t, "the child to reach its gate", func() bool {
+		return strings.Contains(sessionText(s), "gate open")
+	})
+	return s, func() {
+		t.Helper()
+		// The line discipline turns this into the newline `read` wants.
+		if _, err := s.Write([]byte("\r")); err != nil {
+			t.Fatalf("releasing the gate: %v", err)
+		}
+	}
+}
+
 func sessionText(s *Session) string {
 	return stripANSI(string(s.Snapshot().ANSI))
 }
@@ -55,10 +106,16 @@ func stripANSI(text string) string {
 
 func TestOutputReachesEmulatorAndSubscribers(t *testing.T) {
 	engine := newTestEngine(t)
-	s := spawnShell(t, engine, `printf 'hello from the pty\n'; sleep 60`)
+	// Gated: the greeting has to be produced after the attach below, or
+	// this proves nothing about the stream. Spawning a shell that greets
+	// immediately raced it, and a shell that won put the greeting in the
+	// snapshot — where the emulator half of this test found it, while the
+	// subscriber half timed out on bytes that predated it.
+	s, release := spawnGated(t, engine, `printf 'hello from the pty\n'; sleep 60`)
 
 	_, sub := s.Attach(64)
 	defer sub.Close()
+	release()
 
 	waitFor(t, "output in snapshot", func() bool {
 		return strings.Contains(sessionText(s), "hello from the pty")
@@ -86,7 +143,7 @@ func TestInputReachesChild(t *testing.T) {
 	if _, err := s.Write([]byte("windrunner\r")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	waitFor(t, "echoed input", func() bool {
+	waitForStart(t, "echoed input", func() bool {
 		return strings.Contains(sessionText(s), "echoed:windrunner")
 	})
 }
@@ -102,7 +159,7 @@ func TestChildQueriesGetRealAnswers(t *testing.T) {
 	s := spawnShell(t, engine,
 		`stty raw -echo; printf '\033[6n'; reply=$(dd bs=1 count=6 2>/dev/null); stty sane; printf 'reply:%s:end\n' "$reply" | od -An -c; sleep 60`)
 
-	waitFor(t, "cursor position reply", func() bool {
+	waitForStart(t, "cursor position reply", func() bool {
 		return strings.Contains(sessionText(s), "033   [")
 	})
 	// od renders the reply bytes; the emulator's answer must include the
@@ -117,7 +174,7 @@ func TestSnapshotCarriesScrollback(t *testing.T) {
 	engine := newTestEngine(t)
 	s := spawnShell(t, engine, `i=1; while [ $i -le 40 ]; do printf 'line %02d\n' $i; i=$((i+1)); done; sleep 60`)
 
-	waitFor(t, "final line", func() bool {
+	waitForStart(t, "final line", func() bool {
 		return strings.Contains(sessionText(s), "line 40")
 	})
 	// 40 lines through a 24-row terminal: the early lines live only in
@@ -152,7 +209,7 @@ func TestResizePropagatesToChildAndEmulator(t *testing.T) {
 	engine := newTestEngine(t)
 	s := spawnShell(t, engine, `trap 'printf "resized to $(stty size)\n"' WINCH; printf ready\n; while :; do sleep 0.1; done`)
 
-	waitFor(t, "child ready", func() bool {
+	waitForStart(t, "child ready", func() bool {
 		return strings.Contains(sessionText(s), "ready")
 	})
 	if err := s.Resize(100, 30); err != nil {
@@ -168,9 +225,14 @@ func TestResizePropagatesToChildAndEmulator(t *testing.T) {
 
 func TestLaggedSubscriberIsDroppedNotBlocking(t *testing.T) {
 	engine := newTestEngine(t)
-	s := spawnShell(t, engine, `i=0; while [ $i -le 500 ]; do printf 'flood %d\n' $i; i=$((i+1)); done; sleep 60`)
+	// Gated for the same reason the resync tests stopped racing a shell:
+	// a flood that finishes before the attach leaves the subscriber with
+	// nothing to fall behind on, and the drop this test waits for is one
+	// nobody was ever going to make.
+	s, release := spawnGated(t, engine, `i=0; while [ $i -le 500 ]; do printf 'flood %d\n' $i; i=$((i+1)); done; sleep 60`)
 
 	_, sub := s.Attach(1) // tiny buffer, never read
+	release()
 	waitFor(t, "lagged drop", func() bool { return sub.Lagged() })
 	if _, open := <-sub.Output(); open {
 		// Drain one pending chunk is fine; the channel must close soon.
@@ -179,7 +241,8 @@ func TestLaggedSubscriberIsDroppedNotBlocking(t *testing.T) {
 			return !stillOpen
 		})
 	}
-	// The session itself must be unharmed by the slow reader.
+	// The session itself must be unharmed by the slow reader. The child
+	// is long since running by here, so this is the engine's clock.
 	waitFor(t, "flood completion", func() bool {
 		return strings.Contains(sessionText(s), "flood 500")
 	})
@@ -222,7 +285,7 @@ func TestResyncSubscriberSurvivesTheFloodItMissed(t *testing.T) {
 		`i=0; while [ $i -le 500 ]; do printf 'flood %d\n' $i; i=$((i+1)); done
 		 while read line; do printf 'got:%s\n' "$line"; done`)
 
-	waitFor(t, "flood completion", func() bool {
+	waitForStart(t, "flood completion", func() bool {
 		return strings.Contains(sessionText(s), "flood 500")
 	})
 	// One message deep, then overflowed on purpose. Racing a shell to
@@ -293,7 +356,7 @@ func TestResyncArrivesAfterTheOutputStops(t *testing.T) {
 		t.Fatalf("Spawn: %v", err)
 	}
 
-	waitFor(t, "flood completion", func() bool {
+	waitForStart(t, "flood completion", func() bool {
 		return strings.Contains(sessionText(s), "flood 500")
 	})
 	_, sub := s.AttachWith(AttachOptions{Buffer: 1, Resync: true})
@@ -323,7 +386,7 @@ func TestResyncArrivesAfterTheOutputStops(t *testing.T) {
 func TestResyncSurvivesTheStreamEnding(t *testing.T) {
 	engine := newTestEngine(t)
 	s := spawnShell(t, engine, `printf 'LASTWORD\n'; read line; exit 0`)
-	waitFor(t, "the session's last word", func() bool {
+	waitForStart(t, "the session's last word", func() bool {
 		return strings.Contains(sessionText(s), "LASTWORD")
 	})
 
@@ -452,7 +515,7 @@ func TestResyncCostIsPacedNotPerRead(t *testing.T) {
 	}
 }
 
-func nextEvent(t *testing.T, sub *EventSubscription) Event {
+func nextEventWithin(t *testing.T, sub *EventSubscription, limit time.Duration) Event {
 	t.Helper()
 	select {
 	case event, ok := <-sub.Events():
@@ -460,10 +523,15 @@ func nextEvent(t *testing.T, sub *EventSubscription) Event {
 			t.Fatal("event stream closed early")
 		}
 		return event
-	case <-time.After(5 * time.Second):
+	case <-time.After(limit):
 		t.Fatal("timed out waiting for an event")
 	}
 	panic("unreachable")
+}
+
+func nextEvent(t *testing.T, sub *EventSubscription) Event {
+	t.Helper()
+	return nextEventWithin(t, sub, 5*time.Second)
 }
 
 // TestEventsTellTheSessionStory walks the pub/sub stream through a
@@ -489,8 +557,11 @@ func TestEventsTellTheSessionStory(t *testing.T) {
 		t.Fatalf("first event should announce the spawn: %+v", event)
 	}
 	// Sessions start busy, so the greeting produces no event; the first
-	// activity signal is the session going quiet.
-	if event := nextEvent(t, sub); event.Type != EventIdle || event.SessionID != s.ID() {
+	// activity signal is the session going quiet. Quiet is measured from
+	// the greeting, so this event waits out the child's start-up as well
+	// as the idle window — the engine's clock does not start until the
+	// shell speaks.
+	if event := nextEventWithin(t, sub, startupLimit); event.Type != EventIdle || event.SessionID != s.ID() {
 		t.Fatalf("expected idle after the greeting went quiet: %+v", event)
 	}
 	// Input wakes the child; its output is the busy transition.
@@ -523,7 +594,7 @@ func TestEventsTellTheSessionStory(t *testing.T) {
 func TestChildKnowsItsOwnSession(t *testing.T) {
 	engine := newTestEngine(t)
 	s := spawnShell(t, engine, `printf 'sid:%s:end\n' "$WINDRUNNER_SESSION"; sleep 60`)
-	waitFor(t, "session id in child env", func() bool {
+	waitForStart(t, "session id in child env", func() bool {
 		return strings.Contains(sessionText(s), "sid:"+s.ID()+":end")
 	})
 }
@@ -545,7 +616,7 @@ func TestInheritedSessionIDLosesToTheRealOne(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	waitFor(t, "the session's own id in the child env", func() bool {
+	waitForStart(t, "the session's own id in the child env", func() bool {
 		return strings.Contains(sessionText(s), "sid:"+s.ID()+":end")
 	})
 	if text := sessionText(s); strings.Contains(text, "somebody-elses-session") {
@@ -575,7 +646,7 @@ func TestEnvOverrideLandsOnTopOfTheInheritedEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	waitFor(t, "the child's environment", func() bool {
+	waitForStart(t, "the child's environment", func() bool {
 		return strings.Contains(sessionText(s), ":end")
 	})
 	if want := "env:from-the-daemon:fresh:new:end"; !strings.Contains(sessionText(s), want) {
@@ -603,7 +674,7 @@ func TestEnvOverrideCannotForgeTheSessionID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	waitFor(t, "the session's own id in the child env", func() bool {
+	waitForStart(t, "the session's own id in the child env", func() bool {
 		return strings.Contains(sessionText(s), "sid:"+s.ID()+":end")
 	})
 }
@@ -648,7 +719,7 @@ func TestRemoveEndsEverything(t *testing.T) {
 func TestSnapshotReplaysIntoFreshEmulator(t *testing.T) {
 	engine := newTestEngine(t)
 	s := spawnShell(t, engine, `printf '\033[1;31mred alert\033[0m plain\n'; sleep 60`)
-	waitFor(t, "styled output", func() bool {
+	waitForStart(t, "styled output", func() bool {
 		return strings.Contains(sessionText(s), "red alert")
 	})
 
@@ -717,7 +788,7 @@ func TestQueryFloodWithDeafChildDoesNotWedgeTheEngine(t *testing.T) {
 func TestTitleSettingDoesNotDeadlock(t *testing.T) {
 	engine := newTestEngine(t)
 	s := spawnShell(t, engine, `printf '\033]2;herd of one\007'; printf 'titled\n'; sleep 60`)
-	waitFor(t, "output after title", func() bool {
+	waitForStart(t, "output after title", func() bool {
 		return strings.Contains(sessionText(s), "titled")
 	})
 	if got := s.Title(); got != "herd of one" {
@@ -733,7 +804,7 @@ func TestResizeBroadcastsARepaintToSubscribers(t *testing.T) {
 	engine := newTestEngine(t)
 	s := spawnShell(t, engine, `printf 'landmark\n'; while :; do sleep 0.1; done`)
 
-	waitFor(t, "landmark drawn", func() bool {
+	waitForStart(t, "landmark drawn", func() bool {
 		return strings.Contains(sessionText(s), "landmark")
 	})
 	_, sub := s.Attach(16)
@@ -784,7 +855,7 @@ func TestAttachMidEscapeSequenceDoesNotLeakTheTail(t *testing.T) {
 	s := spawnShell(t, engine,
 		`printf 'ground\033]0;Claude'; sleep 0.4; printf ' Code\007landmark\n'; while :; do sleep 0.1; done`)
 
-	waitFor(t, "first half arrived", func() bool {
+	waitForStart(t, "first half arrived", func() bool {
 		return strings.Contains(sessionText(s), "ground")
 	})
 	snapshot, sub := s.Attach(64)
@@ -867,7 +938,7 @@ func TestAttachSeedCarriesScrollMargins(t *testing.T) {
 	s := spawnShell(t, engine,
 		`printf '\033[10;1HFOOTER-STAYS'; printf '\033[1;3r\033[1;1Hone\r\ntwo\r\nthree'; printf ready; sleep 0.4; printf '\r\nfour\r\nfive'; sleep 60`)
 
-	waitFor(t, "region painted", func() bool {
+	waitForStart(t, "region painted", func() bool {
 		return strings.Contains(sessionText(s), "ready")
 	})
 	snapshot, sub := s.Attach(64)
