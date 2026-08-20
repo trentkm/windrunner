@@ -66,8 +66,22 @@ func serveConn(engine *windrunner.Engine, conn net.Conn, cfg config) {
 		case wire.FrameControl:
 			request, err := decodeRequest(payload)
 			if err != nil {
-				respondError(conn, err.Error())
-				return
+				// One bad request, not a broken stream. Frames are
+				// length-prefixed, so this one was read whole and the
+				// reader is already sitting on the next — nothing about
+				// the connection is in doubt, and hanging up would cost
+				// a client every later call to punish one.
+				//
+				// It answers as a refused op rather than as a stream
+				// error for the same reason: a caller that asked for
+				// something this daemon cannot serve has one failure
+				// shape to handle, whether the daemon could not read
+				// the request or could not carry it out.
+				if err := wire.WriteJSON(conn, wire.FrameResponse,
+					wire.Response{Error: err.Error()}); err != nil {
+					return
+				}
+				continue
 			}
 			if err := wire.WriteJSON(conn, wire.FrameResponse, handle(engine, request, cfg)); err != nil {
 				return
@@ -99,6 +113,10 @@ func serveConn(engine *windrunner.Engine, conn net.Conn, cfg config) {
 	}
 }
 
+// respondError is for the connections that have no request/response to
+// answer within: an attach or subscribe that never got started, or a
+// first frame that made no sense. A control connection reports a refused
+// request as a Response instead, and keeps serving.
 func respondError(conn net.Conn, message string) {
 	_ = wire.WriteJSON(conn, wire.FrameError, wire.ErrorPayload{Error: message})
 }
