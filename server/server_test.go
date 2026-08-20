@@ -697,22 +697,107 @@ func TestADaemonRefusesWhatItCannotFullyRead(t *testing.T) {
 	if err := wire.WriteJSON(conn, wire.FrameControl, future); err != nil {
 		t.Fatalf("write: %v", err)
 	}
+	response := readResponse(t, conn)
+	if response.OK {
+		t.Fatal("a request it cannot read must be refused")
+	}
+	// The message has to name the field and say what to do, because the
+	// caller is a program and the person reading it is three layers away.
+	for _, want := range []string{"env_from_the_future", "older", "restart"} {
+		if !strings.Contains(response.Error, want) {
+			t.Fatalf("error should explain itself: %s", response.Error)
+		}
+	}
+}
+
+// TestARefusedRequestCostsOnlyThatRequest is the other half of refusing.
+//
+// A refusal used to take the connection with it, and a client holds one
+// control connection for its whole life — so a single unreadable request
+// ended list, info, kill, resize and input for good. Downstream that reads
+// as losing the daemon rather than as one request being turned away, and
+// the careful message about which field is missing arrives buried under
+// the connection errors that follow it.
+//
+// Frames are length-prefixed, so a request that fails to decode was still
+// read whole: the reader is on the next frame's boundary and nothing about
+// the stream is in doubt. Only the framing layer can decide a connection
+// is unusable.
+func TestARefusedRequestCostsOnlyThatRequest(t *testing.T) {
+	socket := startDaemon(t)
+	conn, err := net.Dial("unix", socket)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	refused := map[string]any{
+		"op":                  "spawn",
+		"command":             "/bin/sh",
+		"args":                []string{"-c", "sleep 60"},
+		"cols":                80,
+		"rows":                24,
+		"env_from_the_future": []string{"WHO=knows"},
+	}
+	if err := wire.WriteJSON(conn, wire.FrameControl, refused); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if response := readResponse(t, conn); response.OK {
+		t.Fatal("the unreadable request should have been refused")
+	}
+
+	// The same connection, still answering. This is the whole point: the
+	// call after a refusal is an ordinary call.
+	if err := wire.WriteJSON(conn, wire.FrameControl, wire.Request{Op: "list"}); err != nil {
+		t.Fatalf("write after a refusal: %v", err)
+	}
+	listed := readResponse(t, conn)
+	if !listed.OK {
+		t.Fatalf("a refusal ended the connection: %s", listed.Error)
+	}
+	// And refusing happens before anything is made, so the request that
+	// was turned away left nothing behind.
+	if len(listed.Sessions) != 0 {
+		t.Fatalf("a refused spawn created something: %+v", listed.Sessions)
+	}
+
+	// A request it can read is still served, on that same connection.
+	if err := wire.WriteJSON(conn, wire.FrameControl, wire.Request{
+		Op:      "spawn",
+		Command: "/bin/sh",
+		Args:    []string{"-c", "sleep 60"},
+		Cols:    80,
+		Rows:    24,
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	spawned := readResponse(t, conn)
+	if !spawned.OK || spawned.Session == nil {
+		t.Fatalf("spawn after a refusal: ok=%v err=%s", spawned.OK, spawned.Error)
+	}
+	if !spawned.Session.Alive {
+		t.Fatal("the session spawned after a refusal is not running")
+	}
+}
+
+// readResponse reads one control answer, insisting it is one: a refusal
+// that arrived as a stream error rather than as a response would be the
+// two failure shapes this protocol is trying not to have.
+func readResponse(t *testing.T, conn net.Conn) wire.Response {
+	t.Helper()
 	frameType, payload, err := wire.ReadFrame(conn)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if frameType != wire.FrameError {
-		t.Fatalf("a request it cannot read must be refused, got frame %d: %s",
+	if frameType != wire.FrameResponse {
+		t.Fatalf("a control call should be answered with a response, got frame %d: %s",
 			frameType, payload)
 	}
-	message := string(payload)
-	// The message has to name the field and say what to do, because the
-	// caller is a program and the person reading it is three layers away.
-	for _, want := range []string{"env_from_the_future", "older", "restart"} {
-		if !strings.Contains(message, want) {
-			t.Fatalf("error should explain itself: %s", message)
-		}
+	var response wire.Response
+	if err := json.Unmarshal(payload, &response); err != nil {
+		t.Fatalf("decode response: %v", err)
 	}
+	return response
 }
 
 // TestAnOrdinarySpawnStillWorks: refusing the unknown must not refuse the

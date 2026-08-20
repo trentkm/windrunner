@@ -2,7 +2,10 @@
 // over a unix socket. Three connection styles share one framing:
 //
 //   - A control connection carries JSON requests and responses (spawn,
-//     list, kill, remove, resize, metadata).
+//     list, kill, remove, resize, metadata). Every request is answered by
+//     a Response and the connection stays open, including when the answer
+//     is a refusal — a request the daemon cannot read or cannot carry out
+//     is one bad request, not a broken stream.
 //   - An attach connection is dedicated to one session: the client sends
 //     Attach, the server answers with a Snapshot, and from then on the
 //     server streams Output frames while the client sends Input and
@@ -150,6 +153,10 @@ type ExitedPayload struct {
 	ExitCode int `json:"exit_code"`
 }
 
+// ErrorPayload reports a failure that has no Response to live in: an
+// attach or subscribe that never started, or a first frame that made no
+// sense. A refused control request is a Response with OK false instead,
+// so that one connection style has one failure shape.
 type ErrorPayload struct {
 	Error string `json:"error"`
 }
