@@ -332,6 +332,13 @@ type AttachOptions struct {
 	// Message.Resync by replacing its replica — one that ignores the
 	// field silently renders a terminal with a hole in it.
 	Resync bool
+	// Cols/Rows, both at least 2, state this viewer's geometry: the
+	// session follows the newest statement among its attached viewers,
+	// the snapshot arrives already wrapped for it, and the statement
+	// retires when the attachment ends. Zero states nothing, which is
+	// what a viewer without a layout must send — the terminal is shared.
+	Cols int
+	Rows int
 }
 
 // Attach opens a dedicated connection to one session and returns after
@@ -346,7 +353,13 @@ func (c *Client) AttachWith(id string, options AttachOptions) (*Attachment, erro
 	if err != nil {
 		return nil, err
 	}
-	request := wire.AttachRequest{ID: id, Buffer: options.Buffer, Resync: options.Resync}
+	request := wire.AttachRequest{
+		ID:     id,
+		Buffer: options.Buffer,
+		Resync: options.Resync,
+		Cols:   options.Cols,
+		Rows:   options.Rows,
+	}
 	if err := wire.WriteJSON(conn, wire.FrameAttach, request); err != nil {
 		conn.Close()
 		return nil, err
@@ -401,7 +414,10 @@ func (a *Attachment) Write(p []byte) error {
 	return wire.WriteFrame(a.conn, wire.FrameInput, p)
 }
 
-// Resize moves the session's terminal.
+// Resize states this viewer's geometry. The session follows the newest
+// statement among its attached viewers and retires this one on detach —
+// so the move holds while this viewer is the latest word, and the
+// terminal settles back to the others when it hangs up.
 func (a *Attachment) Resize(cols, rows int) error {
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
