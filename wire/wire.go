@@ -122,6 +122,14 @@ type AttachRequest struct {
 	// from there. A client that asks for it must treat a mid-stream
 	// Snapshot as a replacement for its replica, not as more output.
 	Resync bool `json:"resync,omitempty"`
+	// Cols/Rows, both at least 2, state this viewer's geometry. The
+	// session follows the newest statement among its attached viewers
+	// and retires this one when the attachment ends; the statement lands
+	// before the snapshot, so the state that answers the attach is
+	// already wrapped for it. Zero states nothing — the terminal is
+	// shared, and a viewer without a layout has no size to state.
+	Cols int `json:"cols,omitempty"`
+	Rows int `json:"rows,omitempty"`
 }
 
 type SnapshotPayload struct {

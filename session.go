@@ -90,6 +90,21 @@ type Session struct {
 	cols     int
 	rows     int
 	subs     map[*Subscription]struct{}
+	// The terminal's size is a function of who is looking at it. Each
+	// attached viewer may state its own geometry — at attach, or with a
+	// resize on its attachment — and the newest statement is the size
+	// the terminal takes. A viewer's statement retires with its
+	// attachment, so nobody owns a terminal they have stopped watching:
+	// when the last-speaking viewer detaches, the terminal settles back
+	// to the newest statement still standing, or to the base size when
+	// no viewer is stating one. base is the spawn geometry until a
+	// control-plane resize rewrites it; unlike a viewer's statement it
+	// never retires, which is what makes it the floor of the fallback.
+	views    map[*Subscription]viewSize
+	viewSeq  uint64
+	baseCols int
+	baseRows int
+	baseSeq  uint64
 	exited   bool
 	exitCode int
 	closed   bool
@@ -113,6 +128,13 @@ type Session struct {
 	// resyncTimer re-offers state to subscribers owed a resync; see
 	// armResyncRetryLocked. Guarded by mu, nil when nothing is owed.
 	resyncTimer *time.Timer
+}
+
+// viewSize is one viewer's stated geometry, stamped with when it was
+// stated: the statement, not the viewer, is what competes.
+type viewSize struct {
+	cols, rows int
+	seq        uint64
 }
 
 func startSession(id string, spec SpawnSpec, publish func(Event)) (*Session, error) {
@@ -174,6 +196,9 @@ func startSession(id string, spec SpawnSpec, publish func(Event)) (*Session, err
 		cols:     spec.Cols,
 		rows:     spec.Rows,
 		subs:     make(map[*Subscription]struct{}),
+		views:    make(map[*Subscription]viewSize),
+		baseCols: spec.Cols,
+		baseRows: spec.Rows,
 		ptyFile:  ptyFile,
 		cmd:      cmd,
 		done:     make(chan struct{}),
@@ -553,9 +578,65 @@ func logStdin(id, source string, p []byte) {
 
 // Resize moves the PTY and the emulator together; the child learns via
 // SIGWINCH (and in-band reports, if it asked for them).
+// Resize sets the session's base size: the geometry the terminal falls
+// back to when no attached viewer is stating one. The write is stamped
+// like a viewer's statement, so it also takes effect now — until a
+// viewer speaks again — but unlike a viewer's it never retires.
 func (s *Session) Resize(cols, rows int) error {
 	if cols < 2 || rows < 2 {
 		return fmt.Errorf("windrunner: %dx%d is no size for a terminal", cols, rows)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.viewSeq++
+	s.baseCols, s.baseRows, s.baseSeq = cols, rows, s.viewSeq
+	return s.applySizeLocked(s.effectiveLocked())
+}
+
+// ResizeViewer records one attached viewer's geometry and follows it —
+// the newest statement across every viewer and the base is the size the
+// terminal takes. Success means the statement was recorded, not that the
+// terminal moved: a viewer whose statement is outdone by a newer one is
+// not an error, it is the ordinary state of a shared terminal.
+//
+// A statement from an attachment that has already ended is dropped: its
+// owner is gone, and recording it would be exactly the ghost this model
+// exists to prevent.
+func (s *Session) ResizeViewer(sub *Subscription, cols, rows int) error {
+	if cols < 2 || rows < 2 {
+		return fmt.Errorf("windrunner: %dx%d is no size for a terminal", cols, rows)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, attached := s.subs[sub]; !attached {
+		return nil
+	}
+	s.viewSeq++
+	s.views[sub] = viewSize{cols: cols, rows: rows, seq: s.viewSeq}
+	return s.applySizeLocked(s.effectiveLocked())
+}
+
+// effectiveLocked is the size the terminal should be right now: the
+// newest statement among the attached viewers and the base. Pure — it
+// reads the statements and nothing else — which is what makes the size
+// settle rather than flap: any sequence of attaches, resizes, and
+// detaches ends at the same answer regardless of arrival order.
+func (s *Session) effectiveLocked() (cols, rows int) {
+	cols, rows = s.baseCols, s.baseRows
+	newest := s.baseSeq
+	for _, view := range s.views {
+		if view.seq > newest {
+			cols, rows, newest = view.cols, view.rows, view.seq
+		}
+	}
+	return cols, rows
+}
+
+// applySizeLocked moves the terminal to the size the statements resolve
+// to, if it is not already there.
+func (s *Session) applySizeLocked(cols, rows int) error {
+	if cols == s.cols && rows == s.rows {
+		return nil
 	}
 	if err := pty.Setsize(s.ptyFile, &pty.Winsize{
 		Cols: uint16(cols),
@@ -563,7 +644,6 @@ func (s *Session) Resize(cols, rows int) error {
 	}); err != nil {
 		return fmt.Errorf("windrunner: resize pty: %w", err)
 	}
-	s.mu.Lock()
 	s.emu.Resize(cols, rows)
 	s.cols, s.rows = cols, rows
 	s.state.resize()
@@ -583,8 +663,32 @@ func (s *Session) Resize(cols, rows int) error {
 	for sub := range s.subs {
 		sub.deliver(message, s)
 	}
-	s.mu.Unlock()
 	return nil
+}
+
+// retireViewerLocked withdraws a departed viewer's statement. The
+// settling itself runs on its own goroutine, because retirement can
+// happen mid-broadcast — a lagged viewer dropped while output fans out —
+// and resizing inside that iteration would hand the remaining
+// subscribers a repaint ordered before bytes that were already on their
+// way.
+func (s *Session) retireViewerLocked(sub *Subscription) {
+	delete(s.subs, sub)
+	if _, spoke := s.views[sub]; !spoke {
+		return
+	}
+	delete(s.views, sub)
+	go s.settleSize()
+}
+
+// settleSize re-resolves the size after a statement retired.
+func (s *Session) settleSize() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.exited {
+		return
+	}
+	_ = s.applySizeLocked(s.effectiveLocked())
 }
 
 // screenRepaintLocked serializes the live screen as a clear-and-repaint:
@@ -767,6 +871,16 @@ type AttachOptions struct {
 	// a wall of live panes — should ask for it; anything that must see
 	// every byte should not.
 	Resync bool
+	// Cols and Rows, both at least 2, state the viewer's own geometry;
+	// the terminal follows the newest statement across its viewers and
+	// retires this one when the attachment ends (see ResizeViewer). The
+	// statement lands before the snapshot is taken, so an attach that
+	// moves the terminal receives bytes already wrapped for it. Zero is
+	// no statement at all: a viewer that does not know its geometry —
+	// a browser pane not yet laid out — must not move a terminal other
+	// viewers share, and a recorder never should.
+	Cols int
+	Rows int
 }
 
 // Attach returns the session's state right now and a subscription that
@@ -785,15 +899,35 @@ func (s *Session) AttachWith(options AttachOptions) (Snapshot, *Subscription) {
 	sub := &Subscription{ch: make(chan Message, buffer), resync: options.Resync}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	snapshot := s.snapshotLocked()
 	if s.exited || s.closed {
 		// The stream is already over; hand back a finished subscription
 		// rather than one that will never speak.
 		sub.finish()
-		return snapshot, sub
+		return s.snapshotLocked(), sub
 	}
 	s.subs[sub] = struct{}{}
-	return snapshot, sub
+	// Retirement is the subscription's side of the size contract: however
+	// the attachment ends — the client detaching, the connection dying —
+	// its statement goes with it, and the terminal settles on whoever is
+	// still watching.
+	sub.retire = func() { s.retireViewer(sub) }
+	if options.Cols >= 2 && options.Rows >= 2 {
+		s.viewSeq++
+		s.views[sub] = viewSize{cols: options.Cols, rows: options.Rows, seq: s.viewSeq}
+		// Before the snapshot, so the state handed back is already
+		// wrapped for the viewer that asked — the attach-then-resize
+		// dance, and the torn frame in the gap, both gone.
+		_ = s.applySizeLocked(s.effectiveLocked())
+	}
+	return s.snapshotLocked(), sub
+}
+
+// retireViewer is retireViewerLocked behind its own lock: the path taken
+// when an attachment ends on its own connection rather than mid-delivery.
+func (s *Session) retireViewer(sub *Subscription) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.retireViewerLocked(sub)
 }
 
 // Kill forcibly ends the child process. Terminal state survives until
@@ -877,6 +1011,12 @@ type Resize struct {
 type Subscription struct {
 	ch     chan Message
 	resync bool
+	// retire withdraws this viewer's size statement from its session;
+	// set at attach, called exactly once when the subscription ends by
+	// any path except the session's own close (a dying session takes
+	// every statement with it). Invoked without holding mu — it takes
+	// the session lock, and delivery holds them in the other order.
+	retire func()
 	mu     sync.Mutex
 	done   bool
 	lagged bool
@@ -904,6 +1044,8 @@ func (sub *Subscription) Lagged() bool {
 // times.
 func (sub *Subscription) Close() {
 	sub.mu.Lock()
+	retire := sub.retire
+	sub.retire = nil
 	if !sub.done {
 		sub.done = true
 		// A dead subscription owes nothing. The flush already skips it,
@@ -914,6 +1056,9 @@ func (sub *Subscription) Close() {
 		close(sub.ch)
 	}
 	sub.mu.Unlock()
+	if retire != nil {
+		retire()
+	}
 }
 
 // deliver hands a chunk to the subscriber without ever blocking the read
@@ -948,8 +1093,11 @@ func (sub *Subscription) deliver(message Message, s *Session) {
 	if !sub.resync {
 		sub.lagged = true
 		sub.done = true
+		// Dropped here rather than through Close, so the retirement runs
+		// with the session lock this delivery already holds.
+		sub.retire = nil
 		close(sub.ch)
-		delete(s.subs, sub)
+		s.retireViewerLocked(sub)
 		return
 	}
 	// Full, and this subscriber would rather repaint than be dropped.

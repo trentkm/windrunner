@@ -24,6 +24,13 @@ extracted, embeddable, and unopinionated about what you build on top.
   position, colors, capabilities) get real answers. Reattach snapshots are
   exact serializations of that state — not lossy screen scrapes, not replay
   logs.
+- **Viewer-owned geometry.** A session's size is a function of who is
+  watching it. Each attachment may state its own geometry — at attach, or
+  by resizing its connection — the newest statement wins, and a statement
+  retires when its attachment ends: a viewer that hangs up cannot leave
+  its size behind on a terminal others share. The control-plane resize op
+  writes the base size the terminal falls back to when no viewer is
+  stating one.
 - **Bytes on the wire.** Clients receive a snapshot, then raw output bytes,
   and send raw input bytes back. Bring any front end: a Go TUI, xterm.js in
   a browser, a recorder, a bot. The client dials through a transport you

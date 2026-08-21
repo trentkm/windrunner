@@ -338,6 +338,8 @@ func serveAttach(engine *windrunner.Engine, conn net.Conn, request wire.AttachRe
 	snapshot, sub := s.AttachWith(windrunner.AttachOptions{
 		Buffer: request.Buffer,
 		Resync: request.Resync,
+		Cols:   request.Cols,
+		Rows:   request.Rows,
 	})
 	defer sub.Close()
 
@@ -433,9 +435,14 @@ func serveAttach(engine *windrunner.Engine, conn net.Conn, request wire.AttachRe
 				return
 			}
 		case wire.FrameResize:
+			// A resize on an attach connection is this viewer's own
+			// statement, not a command to the shared terminal: it wins
+			// while it is the newest, and it retires with the
+			// attachment. The control-plane resize op is the one that
+			// writes the base size.
 			var resize wire.ResizePayload
 			if err := json.Unmarshal(payload, &resize); err == nil {
-				_ = s.Resize(resize.Cols, resize.Rows)
+				_ = s.ResizeViewer(sub, resize.Cols, resize.Rows)
 			}
 		default:
 			// Tolerate unknown frames from newer clients.
