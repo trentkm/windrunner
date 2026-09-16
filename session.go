@@ -85,6 +85,8 @@ type Session struct {
 	mu       sync.Mutex
 	emu      *vt.Emulator
 	metadata map[string]string
+	// revision versions the metadata bag; see Revision.
+	revision uint64
 	title    string
 	state    termState
 	cols     int
@@ -193,6 +195,7 @@ func startSession(id string, spec SpawnSpec, publish func(Event)) (*Session, err
 		peer:     spec.Peer,
 		emu:      emu,
 		metadata: cloneMetadata(spec.Metadata),
+		revision: 1,
 		cols:     spec.Cols,
 		rows:     spec.Rows,
 		subs:     make(map[*Subscription]struct{}),
@@ -513,11 +516,49 @@ func (s *Session) Metadata() map[string]string {
 	return cloneMetadata(s.metadata)
 }
 
-// SetMetadata replaces the session's metadata wholesale.
-func (s *Session) SetMetadata(metadata map[string]string) {
+// Revision reports which version of the metadata is current: 1 for the
+// bag a session was spawned with, one more for every write that replaced
+// it. It is the handle for a conditional write — read the bag and its
+// revision, decide what the bag should become, and write back only while
+// nothing else has moved it.
+func (s *Session) Revision() uint64 {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revision
+}
+
+// SetMetadata replaces the session's metadata wholesale and reports the
+// revision the new bag carries. It is the unconditional form: a writer
+// that read nothing and is overwriting whatever was there.
+func (s *Session) SetMetadata(metadata map[string]string) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.metadata = cloneMetadata(metadata)
-	s.mu.Unlock()
+	s.revision++
+	return s.revision
+}
+
+// SetMetadataIf replaces the metadata only while its revision is still
+// expected, and reports the revision in force afterwards together with
+// whether the write happened. A writer that read the bag at expected and
+// derived the new one from it is guaranteed that nothing else changed the
+// bag in between; a writer that lost that race is told so, with the
+// current revision, and rebuilds its write on a fresh read.
+//
+// Without this, two products of the same bag — a hook stamping an
+// agent's state and a dashboard retiring a request from the same
+// document — are last-writer-wins, and one of them silently undoes the
+// other. The engine does not interpret the bag, so it cannot merge; what
+// it can do is refuse to let a stale copy overwrite a newer one.
+func (s *Session) SetMetadataIf(expected uint64, metadata map[string]string) (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.revision != expected {
+		return s.revision, false
+	}
+	s.metadata = cloneMetadata(metadata)
+	s.revision++
+	return s.revision, true
 }
 
 // Title reports the most recent title the program set (OSC 0/2), or "".

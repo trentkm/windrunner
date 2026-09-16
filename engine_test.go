@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -976,4 +978,65 @@ func (snapshot Snapshot) renderInto(t *testing.T) string {
 	emu := vt.NewEmulator(snapshot.Cols, snapshot.Rows)
 	emu.Write(snapshot.ANSI)
 	return emu.Render()
+}
+
+// TestConditionalWritesNeverLoseAnUpdate is the reason revisions exist:
+// writers that each derive a new bag from the one they read cannot
+// overwrite each other's work, however they interleave. Every goroutine
+// here bumps a counter in the bag; if the total comes out right, no
+// increment was built on a stale read and written over a newer one.
+func TestConditionalWritesNeverLoseAnUpdate(t *testing.T) {
+	engine := newTestEngine(t)
+	s, err := engine.Spawn(SpawnSpec{
+		Command:  "/bin/sh",
+		Args:     []string{"-c", "sleep 60"},
+		Cols:     80,
+		Rows:     24,
+		Metadata: map[string]string{"count": "0"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if got := s.Revision(); got != 1 {
+		t.Fatalf("a fresh session's revision = %d, want 1", got)
+	}
+
+	const writers, each = 8, 50
+	var wg sync.WaitGroup
+	for range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range each {
+				for {
+					revision := s.Revision()
+					bag := s.Metadata()
+					count, _ := strconv.Atoi(bag["count"])
+					bag["count"] = strconv.Itoa(count + 1)
+					if _, ok := s.SetMetadataIf(revision, bag); ok {
+						break
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := s.Metadata()["count"]; got != strconv.Itoa(writers*each) {
+		t.Fatalf("count = %s, want %d: an increment was lost to a stale write", got, writers*each)
+	}
+	if got := s.Revision(); got != 1+writers*each {
+		t.Fatalf("revision = %d, want %d: one per accepted write", got, 1+writers*each)
+	}
+
+	// The unconditional form still moves the revision, so a conditional
+	// writer racing it is told rather than clobbered.
+	before := s.Revision()
+	s.SetMetadata(map[string]string{"count": "reset"})
+	if current, ok := s.SetMetadataIf(before, map[string]string{"count": "stale"}); ok || current != before+1 {
+		t.Fatalf("a stale write after SetMetadata: ok=%v revision=%d, want refused at %d", ok, current, before+1)
+	}
+	if got := s.Metadata()["count"]; got != "reset" {
+		t.Fatalf("the refused write landed anyway: %q", got)
+	}
 }
