@@ -88,6 +88,13 @@ type Request struct {
 	// typically the sending session's own ID (WINDRUNNER_SESSION). The
 	// daemon records it verbatim; it grants nothing.
 	From string `json:"from,omitempty"`
+
+	// set_metadata: write only while the session's metadata is still at
+	// this revision (SessionInfo.Revision). Absent, the write is
+	// unconditional. A stale revision is answered with a Response whose
+	// Conflict is set and whose Session is the session as it stands, so
+	// the writer can rebuild on the current bag and try again.
+	IfRevision *uint64 `json:"if_revision,omitempty"`
 }
 
 // SessionInfo is what the daemon says about a session.
@@ -101,6 +108,9 @@ type SessionInfo struct {
 	Title    string            `json:"title,omitempty"`
 	Peer     bool              `json:"peer,omitempty"`
 	Metadata map[string]string `json:"metadata,omitempty"`
+	// Revision is the metadata's version: 1 at spawn, one more per
+	// write. It is what a conditional set_metadata names.
+	Revision uint64 `json:"revision"`
 }
 
 type Response struct {
@@ -109,6 +119,11 @@ type Response struct {
 	Session  *SessionInfo     `json:"session,omitempty"`
 	Sessions []SessionInfo    `json:"sessions,omitempty"`
 	Snapshot *SnapshotPayload `json:"snapshot,omitempty"`
+	// Conflict marks a refused conditional write: the revision the
+	// request named is no longer current. Session carries the current
+	// one. It is a refusal, so OK is false, but not a malfunction — the
+	// writer is expected to read Session and try again.
+	Conflict bool `json:"conflict,omitempty"`
 }
 
 type AttachRequest struct {

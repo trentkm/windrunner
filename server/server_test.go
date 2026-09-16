@@ -815,3 +815,67 @@ func TestAnOrdinarySpawnStillWorks(t *testing.T) {
 		t.Fatalf("Spawn: %v", err)
 	}
 }
+
+// TestMetadataRevisionsOverTheWire pins the conditional write as a
+// client sees it: every listing names the revision, a write at the
+// current revision lands and reports the next, a write at a stale one is
+// refused with the session as it stands, and the unconditional form
+// still advances the count.
+func TestMetadataRevisionsOverTheWire(t *testing.T) {
+	c := startStack(t)
+	info, err := c.Spawn(wire.Request{
+		Command:  "/bin/sh",
+		Args:     []string{"-c", "sleep 60"},
+		Cols:     80,
+		Rows:     24,
+		Metadata: map[string]string{"state": "spawned"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if info.Revision != 1 {
+		t.Fatalf("spawn reported revision %d, want 1", info.Revision)
+	}
+	listed, err := c.List()
+	if err != nil || len(listed) != 1 || listed[0].Revision != 1 {
+		t.Fatalf("List: %v, %+v", err, listed)
+	}
+
+	after, err := c.SetMetadataIf(info.ID, map[string]string{"state": "first"}, 1)
+	if err != nil {
+		t.Fatalf("SetMetadataIf at the current revision: %v", err)
+	}
+	if after.Revision != 2 || after.Metadata["state"] != "first" {
+		t.Fatalf("after the first write: %+v", after)
+	}
+
+	_, err = c.SetMetadataIf(info.ID, map[string]string{"state": "stale"}, 1)
+	var conflict *client.Conflict
+	if !errors.As(err, &conflict) {
+		t.Fatalf("a stale write returned %v, want a Conflict", err)
+	}
+	if conflict.Current.Revision != 2 || conflict.Current.Metadata["state"] != "first" {
+		t.Fatalf("the conflict does not carry the current session: %+v", conflict.Current)
+	}
+
+	// Rebuilding on what the conflict reported is the whole protocol.
+	rebuilt := conflict.Current.Metadata
+	rebuilt["state"] = "second"
+	after, err = c.SetMetadataIf(info.ID, rebuilt, conflict.Current.Revision)
+	if err != nil || after.Revision != 3 {
+		t.Fatalf("the rebuilt write: %v, %+v", err, after)
+	}
+
+	if err := c.SetMetadata(info.ID, map[string]string{"state": "unconditional"}); err != nil {
+		t.Fatalf("SetMetadata: %v", err)
+	}
+	current, err := c.Info(info.ID)
+	if err != nil || current.Revision != 4 || current.Metadata["state"] != "unconditional" {
+		t.Fatalf("Info after an unconditional write: %v, %+v", err, current)
+	}
+
+	_, err = c.SetMetadataIf("no-such-session", map[string]string{}, 1)
+	if err == nil || errors.As(err, &conflict) {
+		t.Fatalf("a missing session is an error, not a conflict: %v", err)
+	}
+}

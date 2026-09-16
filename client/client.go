@@ -187,10 +187,45 @@ func (c *Client) Resize(id string, cols, rows int) error {
 	return err
 }
 
-// SetMetadata replaces a session's metadata.
+// SetMetadata replaces a session's metadata unconditionally: whatever
+// was there is gone, whoever wrote it. For a bag that more than one
+// writer derives from, that is a lost update waiting to happen — use
+// SetMetadataIf and rebuild on conflict.
 func (c *Client) SetMetadata(id string, metadata map[string]string) error {
 	_, err := c.call(wire.Request{Op: "set_metadata", ID: id, Metadata: metadata})
 	return err
+}
+
+// Conflict is a conditional metadata write refused because the session's
+// bag had moved on. Current is the session as it stands, so the writer
+// can rebuild its bag from it and try again with Current.Revision.
+type Conflict struct {
+	Current wire.SessionInfo
+}
+
+func (c *Conflict) Error() string {
+	return fmt.Sprintf("windrunner: metadata of session %s is at revision %d", c.Current.ID, c.Current.Revision)
+}
+
+// SetMetadataIf replaces a session's metadata only while its revision is
+// still the one given (SessionInfo.Revision, as reported by List, Info,
+// or a previous write), and reports the session as it stands afterwards.
+// A stale revision returns a *Conflict carrying the current session and
+// writes nothing.
+func (c *Client) SetMetadataIf(id string, metadata map[string]string, revision uint64) (wire.SessionInfo, error) {
+	response, err := c.call(wire.Request{
+		Op:         "set_metadata",
+		ID:         id,
+		Metadata:   metadata,
+		IfRevision: &revision,
+	})
+	if response.Conflict && response.Session != nil {
+		return wire.SessionInfo{}, &Conflict{Current: *response.Session}
+	}
+	if err != nil {
+		return wire.SessionInfo{}, err
+	}
+	return *response.Session, nil
 }
 
 // Input delivers terminal input without an attachment — the way

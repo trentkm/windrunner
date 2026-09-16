@@ -222,8 +222,21 @@ func handle(engine *windrunner.Engine, request wire.Request, cfg config) wire.Re
 		if !ok {
 			return wire.Response{Error: "no such session: " + request.ID}
 		}
-		s.SetMetadata(request.Metadata)
-		return wire.Response{OK: true}
+		if request.IfRevision != nil {
+			if current, ok := s.SetMetadataIf(*request.IfRevision, request.Metadata); !ok {
+				info := describe(s)
+				return wire.Response{
+					Error: fmt.Sprintf("metadata revision %d of session %s is stale; it is at %d",
+						*request.IfRevision, request.ID, current),
+					Conflict: true,
+					Session:  &info,
+				}
+			}
+		} else {
+			s.SetMetadata(request.Metadata)
+		}
+		info := describe(s)
+		return wire.Response{OK: true, Session: &info}
 	case "input":
 		s, ok := engine.Session(request.ID)
 		if !ok {
@@ -266,6 +279,7 @@ func describe(s *windrunner.Session) wire.SessionInfo {
 		Title:    s.Title(),
 		Peer:     s.Peer(),
 		Metadata: s.Metadata(),
+		Revision: s.Revision(),
 	}
 }
 

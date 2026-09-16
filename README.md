@@ -46,7 +46,11 @@ extracted, embeddable, and unopinionated about what you build on top.
   wrong one for anything that must see every byte, so it is a choice.
 - **Sessions carry opaque metadata.** Tag sessions with whatever your
   product means by them — task, branch, agent, owner. Windrunner stores and
-  returns the bag; it never interprets it.
+  returns the bag; it never interprets it. It does version it: every
+  listing names the bag's revision, and a write may name the revision it
+  was derived from, to be refused — with the current bag — if anything
+  moved it in between. Two writers deriving from one bag cannot silently
+  undo each other.
 - **Sessions can talk — deliberately.** `windrunner ls`, `peek <id>`
   (print a session's rendered screen), and `send <id> text...` (type text
   plus Enter) are a control plane any program with a shell can drive:
